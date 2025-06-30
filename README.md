@@ -76,11 +76,12 @@ Traditional deep learning frameworks, while powerful, often introduce unacceptab
 
 ### Usage
 
-1.  **Prepare/Generate Data:**
-    The project will include scripts to either:
-    * Download and process a sample dataset of historical tick data (e.g., from LOBSTER dataset if publicly available, or a synthetic generator).
-    * Generate synthetic high-frequency tick data for demonstration purposes.
-    (Details will be provided in `data/README.md` once implemented.)
+1.  **Generate Synthetic Data:**
+    This project includes a script to generate synthetic high-frequency tick data for demonstration purposes. To get started, run the following command:
+    ```bash
+    python data/generate_synthetic_ticks.py --output data/synthetic_ticks.csv
+    ```
+    For more details on data generation and management, please refer to the [`data/README.md`](data/README.md) file.
 
 2.  **Training the Model:**
     ```bash
@@ -114,7 +115,7 @@ Traditional deep learning frameworks, while powerful, often introduce unacceptab
 ├── src/                      # Core source code
 │   ├── init.py
 │   ├── models/               # PyTorch model definitions
-│   │   └── ma_transformer.py
+│   │   └��─ ma_transformer.py
 │   ├── layers/               # PyTorch wrappers for custom CUDA layers
 │   │   ├── init.py
 │   │   ├── sparse_attention.py
