@@ -9,25 +9,42 @@ from model import TransformerModel
 import pandas as pd
 import numpy as np
 import itertools
+import argparse
+import yaml
 
-# --- HYPERPARAMETER GRID ---
-param_grid = {
+# --- CONFIGURATION PARSING ---
+parser = argparse.ArgumentParser(
+    description="Train the Transformer model with YAML config support"
+)
+parser.add_argument(
+    "--config", type=str, default=None,
+    help="Path to YAML config file (overrides hardcoded defaults)"
+)
+args = parser.parse_args()
+config = {}
+if args.config:
+    with open(args.config, 'r') as cfg_file:
+        config = yaml.safe_load(cfg_file)
+
+# --- HYPERPARAMETER GRID (defaults, may be overridden by config) ---
+param_grid = config.get('param_grid', {
     'learning_rate': [0.001, 0.0005],
     'model_dim': [32, 64],
     'num_heads': [2, 4],
     'num_layers': [2, 4]
-}
+})
 
-# --- STATIC PARAMS ---
-sequence_length = 10
-batch_size = 64
-epochs = 100
-patience = 5
-input_dim = 3 # From our feature engineering
+# --- STATIC PARAMS (defaults, may be overridden by config) ---
+sequence_length = config.get('sequence_length', 10)
+batch_size = config.get('batch_size', 64)
+epochs = config.get('epochs', 100)
+patience = config.get('patience', 5)
+input_dim = config.get('input_dim', 3)  # From our feature engineering
 
 # --- DATA LOADING ---
-file_path = '../data/synthetic_ticks_custom.csv'
-(X_train, y_train), (X_val, y_val), (X_test, y_test) = load_and_preprocess_data(file_path, sequence_length)
+file_path = config.get('file_path', 'data/synthetic_ticks_custom.csv')
+(X_train, y_train), (X_val, y_val), (X_test, y_test) = \
+    load_and_preprocess_data(file_path, sequence_length)
 
 X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
 y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
@@ -75,7 +92,8 @@ for v in itertools.product(*values):
         for batch_X, batch_y in train_loader:
             batch_X = batch_X.permute(1, 0, 2)
             outputs = model(batch_X)
-            loss = criterion(outputs.squeeze(), batch_y)
+            pred = outputs[-1, :, :].squeeze()
+            loss = criterion(pred, batch_y)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -86,7 +104,8 @@ for v in itertools.product(*values):
             for batch_X, batch_y in val_loader:
                 batch_X = batch_X.permute(1, 0, 2)
                 outputs = model(batch_X)
-                val_loss += criterion(outputs.squeeze(), batch_y).item()
+                pred = outputs[-1, :, :].squeeze()
+                val_loss += criterion(pred, batch_y).item()
         val_loss /= len(val_loader)
 
         if (epoch + 1) % 10 == 0:
@@ -137,7 +156,8 @@ with torch.no_grad():
     for batch_X, batch_y in test_loader:
         batch_X = batch_X.permute(1, 0, 2)
         outputs = final_model(batch_X)
-        test_loss += criterion(outputs.squeeze(), batch_y).item()
+        pred = outputs[-1, :, :].squeeze()
+        test_loss += criterion(pred, batch_y).item()
 
 test_loss /= len(test_loader)
 print(f'\nFinal Test MSE with best model: {test_loss:.4f}')

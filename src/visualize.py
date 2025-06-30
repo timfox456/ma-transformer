@@ -7,7 +7,7 @@ from data_loader import load_and_preprocess_data
 import numpy as np
 
 # --- CONFIGURATION ---
-MODEL_PATH = '../models/best_model_from_search.pth'
+MODEL_PATH = 'models/best_model_from_search.pth'
 # Use the best hyperparameters from the search
 BEST_HYPERPARAMS = {
     'learning_rate': 0.001, 
@@ -20,7 +20,7 @@ SEQUENCE_LENGTH = 10
 BATCH_SIZE = 64 # Should be the same as in training for consistency
 
 # --- DATA LOADING ---
-file_path = '../data/synthetic_ticks_custom.csv'
+file_path = 'data/synthetic_ticks_custom.csv'
 (_, _), (_, _), (X_test, y_test) = load_and_preprocess_data(file_path, SEQUENCE_LENGTH)
 
 X_test_tensor = torch.tensor(X_test, dtype=torch.float32)

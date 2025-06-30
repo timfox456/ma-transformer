@@ -37,6 +37,7 @@ Traditional deep learning frameworks, while powerful, often introduce unacceptab
 * Python 3.8+
 * `conda` or `venv` for environment management.
 * `make` and a C++ compiler (g++ recommended).
+* PyYAML (for YAML configuration support)
 
 ### Installation
 
@@ -86,8 +87,25 @@ Traditional deep learning frameworks, while powerful, often introduce unacceptab
 2.  **Training the Model:**
     ```bash
     python src/train.py --config configs/default_config.yaml
+    # or simply:
+    python src/train.py
     ```
-    *Configuration files (`configs/`) will allow tuning of hyperparameters, model architecture, and training settings.*
+*Configuration files (`configs/`) allow tuning of hyperparameters, model architecture, and training settings. If `--config` is omitted, built-in defaults are used.*
+
+#### Example configuration file (`configs/default_config.yaml`)
+```yaml
+file_path: ../data/synthetic_ticks_custom.csv
+sequence_length: 10
+batch_size: 64
+epochs: 100
+patience: 5
+input_dim: 3
+param_grid:
+  learning_rate: [0.001, 0.0005]
+  model_dim: [32, 64]
+  num_heads: [2, 4]
+  num_layers: [2, 4]
+```
 
 3.  **Running Inference (Performance Benchmarking):**
     ```bash
