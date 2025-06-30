@@ -103,6 +103,7 @@ Traditional deep learning frameworks, while powerful, often introduce unacceptab
 
 ## Project Structure
 
+```
 ├── AGENTS.md                 # Agent-specific guidelines for collaboration
 ├── README.md                 # This file
 ├── configs/                  # Configuration files for training and inference
@@ -128,5 +129,5 @@ Traditional deep learning frameworks, while powerful, often introduce unacceptab
 ├── setup.py                  # Python setuptools script for building CUDA extensions
 ├── requirements.txt          # Python dependencies
 └── tests/                    # Unit tests for custom kernels and model components
-
+```
 
