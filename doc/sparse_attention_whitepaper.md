@@ -1,7 +1,9 @@
 # The Theory and Mathematics of Sparse Attention Mechanisms
 
-**Author:** Gemini CLI
-**Date:** June 30, 2025
+**Author:** Timothy M Fox
+**Date:** July 1, 2025
+
+---
 
 ## 1. Abstract
 
@@ -112,23 +114,4 @@ Some tokens in a sequence have broad, summary-level importance (e.g., the `[CLS]
 
 In this pattern, we pre-select a small number of tokens to have "global" attention. Let $$G$$ be the set of global token indices.
 
-> The full set of attended indices $$S_i$$ for a token $$i$$ is a union of its local window and the global tokens:
-> $$
-> S_i = \{j \mid |i - j| \le w \} \cup G
-> $$
-> For a global token $$i \in G$$, its attention is dense:
-> $$
-> S_i = \{j \mid 1 \le j \le n\}
-> $$
-
-Models like the Longformer combine a sliding window with global attention on a few key tokens, achieving a balance between local context and global information integration.
-
-### 4.4. Fixed Attention
-
-This pattern, used in models like the ETC (Extended Transformer Construction), pre-selects a fixed number of tokens that all other tokens will attend to, similar to global attention but with a different motivation. It's designed to mimic the structure of sentence parsing, where certain words act as syntactic hubs.
-
----
-
-## 5. Conclusion
-
-Sparse attention is a critical innovation for scaling Transformer models to long sequences. By replacing the dense, quadratic-cost attention matrix with a sparse approximation, these methods reduce computational complexity from $$\mathcal{O}(n^2)$$ to a more manageable $$\mathcal{O}(n \log n)$$ or $$\mathcal{O}(n)$$. The choice of sparsity pattern—be it sliding window, global, or a combination—is a key architectural decision that injects a strong inductive bias into the model. The mathematical formulation, typically implemented via masking before the softmax operation, provides a robust framework for efficiently processing sequences of tens of thousands of tokens or more, opening the door for Transformers to be applied to new domains like high-resolution image processing, document summarization, and genomic analysis.
+> The full set of attended indices $$S_i$$ for a token $$i$$ is a union of its local window and the

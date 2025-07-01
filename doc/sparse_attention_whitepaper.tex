@@ -1,5 +1,6 @@
 \documentclass{article}
 \usepackage{amsmath}
+\usepackage{amsfonts}
 \usepackage{geometry}
 \usepackage{hyperref}
 \usepackage{authblk}
@@ -124,8 +125,12 @@ Models like the Longformer combine a sliding window with global attention on a f
 
 This pattern, used in models like the ETC (Extended Transformer Construction), pre-selects a fixed number of tokens that all other tokens will attend to, similar to global attention but with a different motivation. It's designed to mimic the structure of sentence parsing, where certain words act as syntactic hubs.
 
+
 \section{Conclusion}
 
-Sparse attention is a critical innovation for scaling Transformer models to long sequences. By replacing the dense, quadratic-cost attention matrix with a sparse approximation, these methods reduce computational complexity from \(\mathcal{O}(n^2)\) to a more manageable \(\mathcal{O}(n \log n)\) or \(\mathcal{O}(n)\). The choice of sparsity pattern—be it sliding window, global, or a combination—is a key architectural decision that injects a strong inductive bias into the model. The mathematical formulation, typically implemented via masking before the softmax operation, provides a robust framework for efficiently processing sequences of tens of thousands of tokens or more, opening the door for Transformers to be applied to new domains like high-resolution image processing, document summarization, and genomic analysis.
+Sparse attention is a critical innovation for scaling Transformer models to long sequences. By replacing the dense, quadratic-cost attention matrix with a sparse approximation, these methods reduce computational complexity from \(\mathcal{O}(n^2)\) to a more manageable \(\mathcal{O}(n \log n)\) or \(\mathcal{O}(n)\). The choice of sparsity pattern—be it sliding window, global, or a combination—is a key architectural decision that injects a strong inductive bias into the model. The mathematical formulation, typically implemented via masking before the softmax operation, provides a robust framework for efficiently processing sequences of tens of thousands of tokens or more.
+
+Specifically in the domain of **tick data book replay and prediction**, sparse attention offers a transformative advantage. Traditional dense attention struggles with the immense sequence lengths inherent in high-frequency trading data, where each tick represents a new data point and a "book" can span millions of events over a short period. Sparse attention mechanisms, particularly those employing sliding windows or localized patterns, can efficiently capture relevant short-term dependencies within the order book, while global attention components could be used to attend to critical, less frequent events like large trades or significant price movements. This allows for the construction of models capable of processing vast historical tick data streams for accurate replay simulations and, crucially, for real-time prediction of future price movements or liquidity shifts, unlocking new possibilities in algorithmic trading strategies where processing speed and contextual awareness are paramount.
+
 
 \end{document}

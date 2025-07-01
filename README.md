@@ -28,6 +28,15 @@ Traditional deep learning frameworks, while powerful, often introduce unacceptab
 * **Demonstrative End-to-End Pipeline:** A complete (albeit simplified for demonstration) pipeline from simulated market data ingestion to prediction output.
 * **Comprehensive Profiling:** Integration with NVIDIA Nsight Systems/Compute to demonstrate and analyze performance bottlenecks and optimizations.
 
+
+## Documetn
+
+For a deeper dive into the theoretical underpinnings and mathematical details of sparse attention mechanisms as applied in this project, please refer to the dedicated whitepaper:
+
+* **[The Theory and Mathematics of Sparse Attention Mechanisms](docs/sparse_attention_whitepaper.md)**
+* **[Latex Source](docs/sparse_attention_whitepaper.tex)**
+
+
 ## Getting Started
 
 ### Prerequisites
