@@ -90,10 +90,10 @@ The choice of the set $$S_i$$ for each token $$i$$ defines the "sparsity pattern
 
 For many types of data (text, time series, images), nearby tokens are the most relevant. Sliding window attention formalizes this by allowing each token to attend only to its neighbors within a fixed window size $$w$$.
 
-> The set of attended indices for token $$i$$ is:
-> $$
-> S_i = \{j \mid |i - j| \le w \}
-> $$
+The set of attended indices for token $$i$$ is:
+$$
+S_i = \{j \mid |i - j| \le w \}
+$$
 
 This is highly efficient, as each token only computes $$2w+1$$ attention scores. The complexity is $$\mathcal{O}(n \cdot w)$$, which is linear in $$n$$ if $$w$$ is constant.
 
@@ -101,10 +101,10 @@ This is highly efficient, as each token only computes $$2w+1$$ attention scores.
 
 A limitation of the simple sliding window is that the receptive field is limited. A token can only see information from $$w$$ tokens away. To expand the receptive field without increasing computation, the window can be "dilated."
 
-> With a dilation factor $$d$$ and a window size $$w$$, the set of attended indices is:
-> $$
-> S_i = \{j \mid j = i - k \cdot d, \text{ for } k \in [-w, w] \}
-> $$
+With a dilation factor $$d$$ and a window size $$w$$, the set of attended indices is:
+$$
+S_i = \{j \mid j = i - k \cdot d, \text{ for } k \in [-w, w] \}
+$$
 
 This allows the model to see further back in the sequence with the same computational cost as a standard sliding window.
 
@@ -114,4 +114,30 @@ Some tokens in a sequence have broad, summary-level importance (e.g., the `[CLS]
 
 In this pattern, we pre-select a small number of tokens to have "global" attention. Let $$G$$ be the set of global token indices.
 
-> The full set of attended indices $$S_i$$ for a token $$i$$ is a union of its local window and the
+The full set of attended indices $$S_i$$ for a token $$i$$ is a union of its local window and the global tokens:
+$$
+S_i = \{j \mid |i - j| \le w \} \cup G
+$$
+
+For a global token $i \in G$, its attention is dense:
+$$
+S_i = \{j \mid 1 \le j \le n\}
+$$
+
+Models like the Longformer combine a sliding window with global attention on a few key tokens, achieving a balance between local context and global information integration.
+
+### 4.4. Fixed Attention
+
+This pattern, used in models like the ETC (Extended Transformer Construction), pre-selects a fixed number of tokens that all other tokens will attend to, similar to global attention but with a different motivation. It's designed to mimic the structure of sentence parsing, where certain words act as syntactic hubs.
+
+---
+
+## 5. Conclusion
+
+Sparse attention is a critical innovation for scaling Transformer models to long sequences. By replacing the dense, quadratic-cost attention matrix with a sparse approximation, these methods reduce computational complexity from $\mathcal{O}(n^2)$ to a more manageable $\mathcal{O}(n \log n)$ or $\mathcal{O}(n)$. The choice of sparsity pattern—be it sliding window, global, or a combination—is a key architectural decision that injects a strong inductive bias into the model. The mathematical formulation, typically implemented via masking before the softmax operation, provides a robust framework for efficiently processing sequences of tens of thousands of tokens or more.
+
+Specifically in the domain of **tick data book replay and prediction**, sparse attention offers a transformative advantage. Traditional dense attention struggles with the immense sequence lengths inherent in high-frequency trading data, where each tick represents a new data point and a "book" can span millions of events over a short period. Sparse attention mechanisms, particularly those employing **sliding windows** or localized patterns, can efficiently capture relevant short-term dependencies within the order book. Meanwhile, **global attention components** could be used to attend to critical, less frequent events like large trades or significant price movements. This allows for the construction of models capable of processing vast historical tick data streams for accurate replay simulations and, crucially, for real-time prediction of future price movements or liquidity shifts, unlocking new possibilities in algorithmic trading strategies where processing speed and contextual awareness are paramount.
+
+This enables sparse attention to open the door for Transformers to be applied to new domains like high-resolution image processing, document summarization, and genomic analysis, alongside its significant implications for financial time series analysis.
+
+
