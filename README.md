@@ -33,8 +33,8 @@ Traditional deep learning frameworks, while powerful, often introduce unacceptab
 
 For a deeper dive into the theoretical underpinnings and mathematical details of sparse attention mechanisms as applied in this project, please refer to the dedicated whitepaper:
 
-* **[The Theory and Mathematics of Sparse Attention Mechanisms](docs/sparse_attention_whitepaper.md)**
-* **[Latex Source](docs/sparse_attention_whitepaper.tex)**
+* **[The Theory and Mathematics of Sparse Attention Mechanisms](doc/sparse_attention_whitepaper.md)**
+* **[Latex Source](doc/sparse_attention_whitepaper.tex)**
 
 
 ## Getting Started
