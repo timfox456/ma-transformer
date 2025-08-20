@@ -26,3 +26,9 @@ models/
 .idea/
 *.swp
 *.swo
+
+# Python build artifacts
+build/
+dist/
+*.egg-info/
+*.so
