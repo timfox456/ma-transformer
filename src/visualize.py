@@ -1,76 +1,76 @@
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
-from model import TransformerModel
-from data_loader import load_and_preprocess_data
+import pandas as pd
+from src.data_loader import TickDataset, create_data_loaders
+from src.model import TransformerModel
+import yaml
+import argparse
 import numpy as np
 
-# --- CONFIGURATION ---
-MODEL_PATH = 'models/best_model_from_search.pth'
-# Use the best hyperparameters from the search
-BEST_HYPERPARAMS = {
-    'learning_rate': 0.001, 
-    'model_dim': 64, 
-    'num_heads': 2, 
-    'num_layers': 4
-}
-INPUT_DIM = 3
-SEQUENCE_LENGTH = 10
-BATCH_SIZE = 64 # Should be the same as in training for consistency
+def visualize_predictions(config, model_path):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load data
+    _, _, dataset = create_data_loaders(
+        config['file_path'], 
+        config['sequence_length'], 
+        config['batch_size']
+    )
+    
+    loader = torch.utils.data.DataLoader(dataset, batch_size=config['batch_size'], shuffle=False)
+    
+    # Load model
+    best_hyperparams = {
+        'model_dim': 32,
+        'num_heads': 2,
+        'num_layers': 2
+    }
 
-# --- DATA LOADING ---
-file_path = 'data/synthetic_ticks_custom.csv'
-(_, _), (_, _), (X_test, y_test) = load_and_preprocess_data(file_path, SEQUENCE_LENGTH)
+    model = TransformerModel(
+        input_dim=config['input_dim'],
+        model_dim=best_hyperparams['model_dim'],
+        num_heads=best_hyperparams['num_heads'],
+        num_layers=best_hyperparams['num_layers']
+    ).to(device)
+    
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    
+    actuals = []
+    predictions = []
+    
+    with torch.no_grad():
+        for features, target in loader:
+            features, target = features.to(device), target.to(device)
+            output = model(features)
+            predictions.extend(output.cpu().numpy().flatten())
+            actuals.extend(target.cpu().numpy().flatten())
+            
+    # Un-normalize the data to see the real price movements
+    wap_mean = dataset.feature_means['wap']
+    wap_std = dataset.feature_stds['wap']
+    
+    actuals_price = [a * wap_std + wap_mean for a in actuals]
+    predictions_price = [p * wap_std + wap_mean for p in predictions]
 
-X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
-y_test_tensor = torch.tensor(y_test, dtype=torch.float32)
+    plt.figure(figsize=(15, 7))
+    plt.plot(actuals_price, label='Actual WAP', color='blue', alpha=0.7)
+    plt.plot(predictions_price, label='Predicted WAP', color='red', linestyle='--', alpha=0.7)
+    plt.title('Model Predictions vs. Actual WAP')
+    plt.xlabel('Time Step')
+    plt.ylabel('WAP')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('prediction_visualization.png')
+    plt.show()
 
-test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Visualize model predictions.")
+    parser.add_argument('--config', type=str, default='configs/default_config.yaml', help='Path to config file')
+    parser.add_argument('--model_path', type=str, default='models/best_model_from_search.pth', help='Path to the trained model')
+    args = parser.parse_args()
 
-# --- MODEL LOADING ---
-model = TransformerModel(
-    input_dim=INPUT_DIM,
-    model_dim=BEST_HYPERPARAMS['model_dim'],
-    num_heads=BEST_HYPERPARAMS['num_heads'],
-    num_layers=BEST_HYPERPARAMS['num_layers']
-)
-model.load_state_dict(torch.load(MODEL_PATH))
-model.eval()
-print("Model loaded successfully.")
-
-# --- PREDICTION ---
-all_predictions = []
-all_actuals = []
-
-with torch.no_grad():
-    for batch_X, batch_y in test_loader:
-        batch_X = batch_X.permute(1, 0, 2)
-        outputs = model(batch_X)
-        # The output is of shape (sequence_length, batch_size, 1)
-        # We are interested in the prediction for the next time step, which is the last element of the sequence output
-        # However, our current model outputs a prediction for each input time step.
-        # For this architecture, we'll take the output corresponding to the last input time step.
-        predictions = outputs[-1, :, :].squeeze()
-        all_predictions.extend(predictions.tolist())
-        all_actuals.extend(batch_y.tolist())
-
-print(f"Generated {len(all_predictions)} predictions.")
-
-# --- VISUALIZATION ---
-plt.figure(figsize=(15, 7))
-plt.plot(all_actuals, label='Actual Prices', color='blue', alpha=0.7)
-plt.plot(all_predictions, label='Predicted Prices', color='red', linestyle='--', alpha=0.7)
-plt.title('Model Predictions vs. Actual Prices on Test Data')
-plt.xlabel('Time Step')
-plt.ylabel('Price')
-plt.legend()
-plt.grid(True)
-
-# Save the plot
-output_path = '../prediction_visualization.png'
-plt.savefig(output_path)
-print(f"Plot saved to {output_path}")
-
-plt.show()
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
+        
+    visualize_predictions(config, args.model_path)

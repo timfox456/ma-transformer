@@ -1,0 +1,12 @@
+
+file_path: data/synthetic_ticks.csv
+sequence_length: 10
+batch_size: 64
+epochs: 100
+patience: 5
+input_dim: 5
+param_grid:
+  learning_rate: [0.001, 0.0005]
+  model_dim: [32, 64]
+  num_heads: [2, 4]
+  num_layers: [2, 4]

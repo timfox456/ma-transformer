@@ -1,58 +1,50 @@
+
+import torch
+from torch.utils.data import Dataset, DataLoader
 import pandas as pd
-from sklearn.model_selection import train_test_split
 import numpy as np
 
-def load_and_preprocess_data(file_path: str, sequence_length: int, test_size: float = 0.2, validation_size: float = 0.2):
-    """
-    Loads and preprocesses the synthetic tick data with moving average features.
+class TickDataset(Dataset):
+    def __init__(self, file_path, sequence_length=10):
+        self.sequence_length = sequence_length
+        
+        # Load and preprocess data
+        df = pd.read_csv(file_path)
+        
+        # Calculate microstructure features
+        df['bid_ask_spread'] = df['ask_price'] - df['bid_price']
+        df['wap'] = (df['bid_price'] * df['ask_volume'] + df['ask_price'] * df['bid_volume']) / (df['bid_volume'] + df['ask_volume'])
+        df['order_book_imbalance'] = df['bid_volume'] / (df['bid_volume'] + df['ask_volume'])
+        df['time_diff'] = df['timestamp'].diff().fillna(0)
 
-    Args:
-        file_path (str): The path to the CSV file.
-        sequence_length (int): The length of the input sequences.
-        test_size (float): The proportion of the dataset to allocate to the test set.
-        validation_size (float): The proportion of the training set to allocate to the validation set.
+        # Select and normalize features
+        features_to_normalize = ['price', 'bid_ask_spread', 'wap', 'order_book_imbalance', 'time_diff']
+        self.feature_means = df[features_to_normalize].mean()
+        self.feature_stds = df[features_to_normalize].std()
 
-    Returns:
-        A tuple containing the training, validation, and test sets.
-    """
-    # Load the data
-    df = pd.read_csv(file_path)
+        normalized_df = (df[features_to_normalize] - self.feature_means) / self.feature_stds
+        
+        self.features = normalized_df.values
 
-    # Calculate moving averages
-    df['ma_5'] = df['price'].rolling(window=5).mean()
-    df['ma_20'] = df['price'].rolling(window=20).mean()
+    def __len__(self):
+        return len(self.features) - self.sequence_length
 
-    # Handle NaN values by back-filling
-    df.bfill(inplace=True)
+    def __getitem__(self, idx):
+        features = self.features[idx:idx+self.sequence_length]
+        # The target is the next WAP
+        target = self.features[idx+self.sequence_length, 2] # Index 2 corresponds to WAP
+        
+        return torch.tensor(features, dtype=torch.float32), torch.tensor(target, dtype=torch.float32)
 
-    # Select features
-    features = ['price', 'ma_5', 'ma_20']
-    data = df[features].values
-    target = df['price'].values
-
-    # Create sequences
-    X, y = [], []
-    for i in range(len(data) - sequence_length):
-        X.append(data[i:(i + sequence_length)])
-        y.append(target[i + sequence_length])
-
-    X = np.array(X)
-    y = np.array(y)
-
-    # Split into training and test sets
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, shuffle=False)
-
-    # Split training set into training and validation sets
-    X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=validation_size, shuffle=False)
-
-    return (X_train, y_train), (X_val, y_val), (X_test, y_test)
-
-if __name__ == '__main__':
-    # Example usage
-    file_path = '../data/synthetic_ticks_custom.csv'
-    sequence_length = 10
-    (X_train, y_train), (X_val, y_val), (X_test, y_test) = load_and_preprocess_data(file_path, sequence_length)
-
-    print("Training set shape:", X_train.shape, y_train.shape)
-    print("Validation set shape:", X_val.shape, y_val.shape)
-    print("Test set shape:", X_test.shape, y_test.shape)
+def create_data_loaders(file_path, sequence_length, batch_size, train_split=0.8):
+    dataset = TickDataset(file_path, sequence_length)
+    
+    # Split dataset into training and validation sets
+    train_size = int(train_split * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    
+    return train_loader, val_loader, dataset # Return dataset to access means/stds for visualization
