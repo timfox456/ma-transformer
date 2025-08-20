@@ -1,21 +1,27 @@
 
 from setuptools import setup, Extension
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from setuptools.command.build_ext import build_ext
+import pybind11
+import sys
 
-ext_modules = []
-try:
-    ext_modules.append(
-        CUDAExtension('ma_transformer_cuda', [
-            'src/cuda/sparse_attention_kernel.cu',
-        ])
+
+# Pure C++ extension without PyTorch dependencies
+ext_modules = [
+    Extension(
+        'ma_core',
+        sources=[
+            'src/csrc/main.cpp', 
+            'src/csrc/ma_core.cpp',
+            'src/csrc/tensor.cpp'
+        ],
+        include_dirs=[pybind11.get_include(), 'src/csrc'],
+        language='c++',
+        extra_compile_args=['-std=c++17', '-O3'] + (['-stdlib=libc++'] if sys.platform == 'darwin' else []),
+        extra_link_args=['-stdlib=libc++'] if sys.platform == 'darwin' else []
     )
-except OSError:
-    print("CUDA_HOME not set, skipping CUDA extension.")
-
+]
 
 setup(
-    name='ma_transformer_cuda',
     ext_modules=ext_modules,
-    cmdclass={
-        'build_ext': BuildExtension
-    })
+    cmdclass={'build_ext': build_ext}
+)

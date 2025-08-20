@@ -4,23 +4,42 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-# Check if the CUDA extension is available
+# Check if ma_core C++ extension is available
+try:
+    import ma_core
+    from .ma_core_bridge import MACoreAttention, pytorch_sparse_attention
+    MA_CORE_AVAILABLE = True
+    print("ma_core C++ engine available. Using high-performance attention implementation.")
+except ImportError:
+    MA_CORE_AVAILABLE = False
+    print("ma_core extension not available. Falling back to PyTorch implementation.")
+
+# Legacy CUDA check for backward compatibility
 try:
     import ma_transformer_cuda
     CUDA_AVAILABLE = True
 except ImportError:
     CUDA_AVAILABLE = False
-    print("CUDA extension not available. Falling back to PyTorch implementation.")
 
 
 class SparseAttention(nn.Module):
     """
-    Sparse Attention layer with a fallback to a PyTorch implementation.
+    Sparse Attention layer with multiple implementation backends.
+    Priority: ma_core C++ > CUDA > PyTorch fallback.
     Uses a sliding window attention pattern.
     """
-    def __init__(self, window_size=3):
+    def __init__(self, window_size=3, use_ma_core=True):
         super(SparseAttention, self).__init__()
         self.window_size = window_size
+        self.use_ma_core = use_ma_core
+        
+        # Initialize ma_core attention if available
+        if MA_CORE_AVAILABLE and use_ma_core:
+            self.ma_core_attention = MACoreAttention(
+                sparse=True, 
+                window_size=window_size,
+                fallback_training=True  # Use PyTorch during training for gradients
+            )
 
     def forward(self, q, k, v):
         """
@@ -28,18 +47,38 @@ class SparseAttention(nn.Module):
 
         Args:
             q (torch.Tensor): Query tensor of shape (batch_size, seq_len, model_dim)
-            k (torch.Tensor): Key tensor of shape (batch_size, seq_len, model_dim)
+            k (torch.Tensor): Key tensor of shape (batch_size, seq_len, model_dim)  
             v (torch.Tensor): Value tensor of shape (batch_size, seq_len, model_dim)
 
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, seq_len, model_dim)
         """
-        if self.training or not CUDA_AVAILABLE:
-            # Use PyTorch implementation for training or if CUDA is not available
-            return self._pytorch_forward(q, k, v)
-        else:
-            # Use CUDA implementation for inference
+        
+        # Reshape to multi-head format if needed
+        batch_size, seq_len, model_dim = q.shape
+        
+        # For simplicity, treat as single head attention
+        # In production, you'd want proper multi-head handling
+        num_heads = 1
+        head_dim = model_dim
+        
+        # Reshape: [batch, seq, model_dim] -> [batch, seq, heads, head_dim]
+        q_reshaped = q.unsqueeze(2)  # [batch, seq, 1, model_dim]
+        k_reshaped = k.unsqueeze(2)
+        v_reshaped = v.unsqueeze(2)
+        
+        # Use ma_core C++ engine if available (highest priority)
+        if MA_CORE_AVAILABLE and self.use_ma_core and hasattr(self, 'ma_core_attention'):
+            output = self.ma_core_attention(q_reshaped, k_reshaped, v_reshaped)
+            return output.squeeze(2)  # Remove head dimension
+        
+        # Fall back to CUDA implementation if available
+        elif self.training is False and CUDA_AVAILABLE:
             return ma_transformer_cuda.forward(q, k, v)
+        
+        # Fall back to PyTorch implementation
+        else:
+            return self._pytorch_forward(q, k, v)
 
     def _pytorch_forward(self, q, k, v):
         batch_size, seq_len, model_dim = q.size()

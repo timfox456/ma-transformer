@@ -1,8 +1,7 @@
-pyyaml
-matplotlib
-scikit-learn
+torch
 pandas
 numpy
-torch
-torchvision
-torchaudio
+scikit-learn
+pyyaml
+matplotlib
+pybind11
