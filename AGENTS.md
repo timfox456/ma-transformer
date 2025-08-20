@@ -1,92 +1,105 @@
 # AGENTS.md: AI Agent Directives for `ma-transformer` Project
 
-This document provides directives and guidelines for AI agents (e.g., `gemini-cli`, `codex`, automated code generation tools) interacting with the `ma-transformer` project. The goal is to enable AI agents to understand the project's purpose, contribute effectively, and maintain code quality and performance standards.
+This document aligns AI agent contributions with the current state of the repository and the design notes in `.gemini/GEMINI.md`. It explains what exists today, the intended direction, and how to contribute safely and effectively.
 
-### **I. Project Context and Core Objectives**
+### I. Project Context and Current Objectives
 
-* **Project Name:** `ma-transformer`
-* **Primary Goal:** Develop an ultra-low latency, GPU-accelerated deep learning framework for predicting order book imbalances in high-frequency trading (HFT).
-* **Key Differentiator:** Extensive use of **custom C++ CUDA kernels** for performance-critical components where standard deep learning frameworks introduce unacceptable latency or do not support required optimizations.
-* **Target Performance:** Sub-millisecond inference latency from raw tick data to prediction output.
-* **Core Technologies:** NVIDIA CUDA (C++), PyTorch (Python, with C++ extensions).
-* **Primary Focus Areas for AI Assistance:**
-    1.  **CUDA Kernel Development & Optimization:** Generating, optimizing, and debugging C++ CUDA code.
-    2.  **PyTorch C++ Extension Integration:** Bridging custom CUDA kernels with PyTorch.
-    3.  **Performance Analysis & Bottleneck Identification:** Interpreting profiling data and suggesting optimizations.
-    4.  **Code Generation (Python/CUDA):** Generating boilerplate, test cases, or initial implementations based on high-level descriptions.
-    5.  **Documentation & Explanation:** Providing clear explanations of complex concepts or code segments.
+- **Project Name:** `ma-transformer`
+- **Problem Domain:** High-frequency trading (HFT) on market microstructure data (tick-level sequences).
+- **Core Goal (current):** Provide a high-performance attention engine (dense and sparse) via a custom C++ backend (`ma_core`) integrated with PyTorch, with correct training support and low-latency inference. CUDA acceleration is desired but currently partial.
+- **Key Differentiator (today):** A custom C++17 attention engine compiled as a Python extension via `pybind11` (`ma_core`), offering dense and sliding-window sparse attention with an extensible factory. A PyTorch bridge (`MACoreAttention`) routes inference to C++ while using PyTorch for gradients.
+- **Target Performance (aspirational):** Sub-millisecond end-to-end inference. Current bottlenecks include bridge tensor conversions and absence of a CUDA path in critical kernels.
+- **Core Technologies:** C++17, `pybind11`, PyTorch; optional backends enumerated in code (`CPU`, `MPS`, `CUDA`, `ROCm`). CUDA kernels exist as stubs under `src/cuda/`.
 
-### **II. General Directives for AI Agents**
+### II. Repository Structure (authoritative)
 
-1.  **Prioritize Performance:** When generating or modifying code, especially in `src/cuda/`, the absolute highest priority is low-latency and high-throughput execution on NVIDIA GPUs. Assume memory bandwidth and kernel launch overhead are critical bottlenecks.
-2.  **CUDA Idioms & Best Practices:** Adhere strictly to NVIDIA CUDA C++ best practices:
-    * **Memory Coalescing:** Ensure global memory accesses are coalesced.
-    * **Shared Memory:** Utilize shared memory for on-chip caching and reducing global memory traffic where applicable.
-    * **Thread Synchronization:** Use `__syncthreads()` judiciously.
-    * **Occupancy:** Consider factors affecting GPU occupancy (register usage, shared memory, block size).
-    * **Error Handling:** Include robust CUDA error checking in kernel wrappers and host-side code.
-    * **Asynchronous Operations:** Favor `cudaStream_t` for asynchronous operations.
-3.  **Explain Rationale:** For non-trivial code suggestions or architectural changes, provide a brief explanation of *why* the approach was chosen, especially regarding its performance implications.
-4.  **Modular & Testable Code:** Generate code that is modular, readable, and includes suggestions for unit tests, particularly for custom CUDA kernels.
-5.  **Adhere to Project Structure:** Place generated code in the appropriate directories (`src/cuda/`, `src/layers/`, `tests/`, etc.) as defined in `README.md`.
-6.  **Avoid Hallucination:** If information is uncertain or requires external context not provided, state the limitation or ask for clarification. Do not generate speculative or incorrect code.
-7.  **Identify Dependencies:** Clearly state any new dependencies (Python packages, CUDA libraries, etc.) required for generated code.
+- `src/csrc/`: C++ attention engine (ma_core)
+  - `tensor.hpp/.cpp`: Lightweight tensor and shapes; device enum.
+  - `dense_attention.cpp`, `sparse_attention.cpp`: Core attention implementations.
+  - `attention_interface.hpp`, `attention_types.hpp`, `attention_factory.cpp`: Base classes, configs, and factory (`create_attention`).
+  - `ma_core.cpp/.hpp`, `main.cpp`: Public API and `pybind11` bindings (module: `ma_core`).
+- `src/layers/`:
+  - `ma_core_bridge.py`: `MACoreAttentionFunction` and `MACoreAttention` bridging PyTorch tensors to `ma_core` and falling back to PyTorch for backward.
+  - `sparse_attention.py`: High-level wrapper that prefers `ma_core`, otherwise PyTorch.
+- `src/cuda/`: CUDA extension stubs (e.g., `sparse_attention_kernel.cu`), not yet wired into the training/inference path.
+- `src/model.py`, `src/data_loader.py`, `src/train.py`: Example model, data pipeline, and training script.
+- `tests/`:
+  - `cpp/`: GoogleTest C++ tests for `ma_core` components.
+  - `python/`: `unittest` for the Python bindings and tensor utilities.
+  - `integration/`: `pytest` integration for PyTorch bridge and end-to-end behavior.
+- Project tooling: `setup.py`/`pyproject.toml`, `run_tests.py`, `pytest.ini`, and example/benchmark scripts.
 
-### **III. Task-Specific Directives & Constraints**
+### III. Current Capabilities and Gaps
 
-When responding to specific requests, AI agents should consider the following:
+- **Inference path:** `MACoreAttention` forwards to `ma_core` for dense/sparse attention; correct shapes and device enums are validated via bindings.
+- **Training path:** Backward currently falls back to PyTorch reference implementations in the bridge for gradient correctness.
+- **Tensor conversion:** `pytorch_to_ma_core` and `ma_core_to_pytorch` use placeholder logic (no zero-copy; missing setters/getters on `ma_core::Tensor`). This is a known performance bottleneck.
+- **CUDA:** `src/cuda/` contains initial stubs; the production path relies on the C++ engine (`pybind11`), not a `torch.utils.cpp_extension` module.
+- **Device support:** Code enumerates `CPU`, `MPS`, `CUDA`, `ROCm`; real paths implemented focus on CPU/MPS-compatible behavior through `pybind11` and PyTorch.
 
-#### **A. CUDA Kernel Generation/Modification Requests:**
+### IV. High-Impact Focus Areas for AI Assistance
 
-* **Input:** Description of the financial operation (e.g., "calculate weighted bid-ask spread," "sparse attention with sliding window," "fused MLP block").
-* **Output:** C++ CUDA `.cu` file content (kernel definition and host-side wrapper).
-* **Constraints:**
-    * **Kernel Signature:** Suggest appropriate kernel arguments (pointers to device memory, dimensions, parameters).
-    * **Grid/Block Configuration:** Propose reasonable `<<<grid, block>>>` dimensions, explaining the rationale.
-    * **Memory Usage:** Suggest efficient memory access patterns.
-    * **Template Use:** Employ C++ templates for data types or dimensions where flexibility is beneficial.
-    * **Error Checking:** Include `CUDA_CHECK` macros or similar for robustness.
+1. **Bridge Efficiency:**
+   - Add data access methods to `ma_core::Tensor` (read/write, contiguous storage view) and implement efficient copy or zero-copy pathways in `ma_core_bridge.py`.
+   - Avoid Python-side element loops; prefer bulk memory transfers and shape-aware views.
 
-#### **B. PyTorch C++ Extension Integration Requests:**
+2. **Backward in C++:**
+   - Design and implement backward kernels (dense and sparse) in `ma_core` with consistent numerics to PyTorch.
+   - Expose via `pybind11` and update `MACoreAttentionFunction.backward` to call C++ when available.
 
-* **Input:** Existing CUDA kernel definition, desired PyTorch layer functionality.
-* **Output:** Python `torch.autograd.Function` class definition, `setup.py` modifications if needed.
-* **Constraints:**
-    * **`forward` Method:** Correctly call the CUDA kernel, managing input tensors and output device tensors.
-    * **`backward` Method:** Suggest a high-level approach for implementing the backward pass (gradients), noting that this often requires a separate custom CUDA kernel.
-    * **Input/Output Handling:** Ensure correct tensor types, device placement, and dimensions.
-    * **`setup.py`:** Provide necessary directives for `setuptools.Extension` to compile the CUDA source.
+3. **Sparse Patterns and Factory:**
+   - Extend `sparse_attention` with additional patterns (block-sparse, dilated, causal windowing) via `attention_factory.cpp` while maintaining memory predictability.
 
-#### **C. Performance Analysis & Optimization Requests:**
+4. **CUDA Acceleration Path:**
+   - Flesh out `src/cuda/` kernels for attention paths and integrate them under a unified API (either through `ma_core` device dispatch or a separate Torch extension), with robust error checking and streams.
 
-* **Input:** A description of a performance issue, potentially with snippets of code or hypothetical Nsight Systems output.
-* **Output:** Analysis of potential bottlenecks (e.g., "high global memory traffic," "low occupancy," "branch divergence"), and specific code-level suggestions for optimization.
-* **Constraints:**
-    * **Specificity:** Provide actionable advice, not just general principles.
-    * **Quantification:** If possible, describe the expected performance impact (e.g., "could reduce memory bandwidth by X%").
+5. **Testing and Benchmarks:**
+   - Expand integration tests to validate parity between PyTorch and `ma_core` outputs/gradients across shapes/devices.
+   - Add microbenchmarks to detect regressions in copy/conversion and attention throughput.
 
-#### **D. Code Generation (General Python/CUDA) Requests:**
+### V. Directives for Contributions
 
-* **Input:** High-level description of a module, utility function, or test case.
-* **Output:** Python `.py` file content or C++ CUDA `.cu/.cuh` file content.
-* **Constraints:**
-    * **Modularity:** Generate functions/classes that are self-contained and have clear responsibilities.
-    * **Readability:** Follow common coding standards (PEP 8 for Python, standard C++ for CUDA).
-    * **Testable:** Design with testing in mind; suggest basic test cases where appropriate.
+- **Performance First:** Minimize data movement between Python and C++; coalesce memory accesses; consider cache locality. If implementing CUDA, ensure coalesced global memory, appropriate shared memory use, and occupancy-aware block sizing.
+- **API Stability:** Extend `ma_core` via clear headers (`ma_core.hpp`, `attention_interface.hpp`) and bindings in `main.cpp`. Keep Python bridge signatures stable; add feature flags where needed.
+- **Asynchrony:** Prefer async execution (`cudaStream_t`) and non-blocking transfers when adding CUDA paths. Keep Python-side synchronization minimal and explicit.
+- **Error Handling:** Add robust checks in both C++ and Python (shape/device/dtype assertions; CUDA error checks). Surface actionable error messages through `pybind11` exceptions.
+- **Modularity & Tests:** Keep new features modular. Provide or update tests under `tests/{cpp,python,integration}`. Targeted unit tests are preferred over broad rewrites.
 
-#### **E. Documentation & Explanation Requests:**
+### VI. Task-Specific Guidance
 
-* **Input:** A specific code snippet, algorithm, or concept requiring explanation.
-* **Output:** Clear, concise, and accurate explanatory text.
-* **Constraints:**
-    * **Technical Accuracy:** Ensure all technical details are correct.
-    * **Clarity:** Use simple language where possible, define technical terms.
-    * **Context:** Relate explanations back to the `ma-transformer` project's HFT context.
+- **A. C++/CUDA Attention Work:**
+  - Define kernels/APIs with explicit tensor shapes: `[batch, seq, heads, dim]`.
+  - For sparse attention, prefer sliding-window/block-sparse indices with predictable memory footprints; document memory use via helpers (e.g., `SparseTensor::nnz`).
+  - Provide `CUDA_CHECK`-style macros and optional stream parameters in host wrappers.
 
-### **IV. Interaction Protocol**
+- **B. PyTorch Bridge Updates:**
+  - Maintain `MACoreAttentionFunction` interface. When adding C++ backward, gate by availability and add test coverage for gradients (e.g., `torch.autograd.gradcheck`).
+  - Implement efficient conversions by exposing contiguous buffers from `ma_core::Tensor` and binding them; avoid Python loops.
 
-* **Explicit Instructions:** Users will provide clear and explicit instructions for tasks.
-* **Iterative Refinement:** AI agents should be prepared for iterative requests for refinement or debugging.
-* **Contextual Awareness:** AI agents should leverage the entire repository content (especially `README.md` and other code files) as context for their responses.
+- **C. Build Integration:**
+  - Keep `pybind11`-based module `ma_core` as the primary entry point. If adding Torch CUDA extensions, update `setup.py` to conditionally build them and document optional dependencies.
 
-By adhering to these directives, AI agents can become invaluable contributors to the `ma-transformer` project, accelerating development and helping achieve its ambitious performance goals.
+- **D. Performance Analysis:**
+  - Quantify changes with microbenchmarks (latency/throughput, memory bandwidth). Highlight expected wins (e.g., “remove per-element Python loop, expect >10x copy speedup”).
+  - Call out specific bottlenecks (copy-in/copy-out, softmax normalization, pattern generation) and propose code-level fixes.
+
+### VII. Dependencies and Tooling
+
+- **C++/Bindings:** C++17, `pybind11`.
+- **Python/ML:** PyTorch.
+- **Testing:** GoogleTest (`tests/cpp`), `unittest` (`tests/python`), `pytest` (`tests/integration`).
+- **Build:** `setuptools` for `ma_core` extension; `Makefile`/`CMakeLists.txt` for C++ tests.
+
+### VIII. How to Validate Changes
+
+- Build the extension: `pip install -e .`
+- Run tests: `python run_tests.py` or targeted suites under `tests/`.
+- For CUDA additions, include smoke tests that skip gracefully if CUDA is unavailable.
+
+### IX. Interaction Protocol
+
+- **Explicit Instructions:** Prefer specific tasks (e.g., “implement C++ backward for dense attention”).
+- **Iterative Refinement:** Expect follow-ups from maintainers; keep changes scoped and explain performance rationale briefly in PRs.
+- **Context Awareness:** Refer to `README.md`, `.gemini/GEMINI.md`, and code in `src/csrc/` and `src/layers/` before proposing architectural changes.
+
+By following these directives, AI agents can extend the engine, improve latency, and move the project toward robust, GPU-accelerated production readiness while preserving correctness and testability.

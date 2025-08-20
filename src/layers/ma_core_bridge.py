@@ -92,47 +92,27 @@ def pytorch_to_ma_core(tensor: torch.Tensor) -> 'ma_core.Tensor':
     """Convert PyTorch tensor to ma_core tensor."""
     # Ensure tensor is contiguous and on CPU for C++ processing
     cpu_tensor = tensor.detach().cpu().contiguous()
-    
-    # Get shape in ma_core format: [batch, seq, heads, dim]
+    # Shape in ma_core format: [batch, seq, heads, dim]
     batch_size, seq_len, num_heads, head_dim = cpu_tensor.shape
     shape = [batch_size, seq_len, num_heads, head_dim]
-    
-    # Create ma_core tensor
+    # Create ma_core tensor and bulk copy from NumPy
     mc_tensor = ma_core.create_tensor(shape)
-    
-    # Copy data (simple approach - could be optimized)
-    data = cpu_tensor.numpy().flatten()
-    for i, val in enumerate(data):
-        # This is inefficient but works for the bridge
-        # In a production version, we'd want direct memory access
-        b = i // (seq_len * num_heads * head_dim)
-        remaining = i % (seq_len * num_heads * head_dim)
-        s = remaining // (num_heads * head_dim)
-        remaining = remaining % (num_heads * head_dim)
-        h = remaining // head_dim
-        d = remaining % head_dim
-        
-        if b < batch_size and s < seq_len and h < num_heads and d < head_dim:
-            # Note: This is a placeholder - ma_core.Tensor needs a set method
-            pass  # Would set mc_tensor.at(b, s, h, d) = val
-    
+    np_view = cpu_tensor.numpy()  # shares memory with cpu_tensor
+    mc_tensor.copy_from_numpy(np_view)
     return mc_tensor
 
 
 def ma_core_to_pytorch(mc_tensor: 'ma_core.Tensor', device: torch.device, 
                       dtype: torch.dtype) -> torch.Tensor:
     """Convert ma_core tensor to PyTorch tensor."""
-    shape_obj = mc_tensor.shape()
-    batch_size = shape_obj.batch_size
-    seq_len = shape_obj.sequence_length
-    num_heads = shape_obj.num_heads
-    head_dim = shape_obj.head_dim
-    
-    # Create PyTorch tensor
-    # For now, create zeros - in production we'd copy actual data
-    tensor = torch.zeros(batch_size, seq_len, num_heads, head_dim, dtype=dtype, device=device)
-    
-    return tensor
+    # Pull data to NumPy (float32), then wrap as torch tensor and move/cast
+    np_arr = mc_tensor.to_numpy()
+    out_cpu = torch.from_numpy(np_arr)  # shares memory (CPU)
+    if out_cpu.dtype != dtype:
+        out_cpu = out_cpu.to(dtype)
+    if device.type != 'cpu':
+        return out_cpu.to(device)
+    return out_cpu
 
 
 def pytorch_dense_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,

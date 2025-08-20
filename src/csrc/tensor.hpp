@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 #include <stdexcept>
+#include <cstring>
 
 namespace ma_core {
 
@@ -45,6 +46,7 @@ namespace ma_core {
         MemoryLayout layout() const { return layout_; }
         
         index_t size() const { return shape_.total_elements(); }
+        size_t nbytes() const { return static_cast<size_t>(size()) * sizeof(scalar_t); }
         bool empty() const { return size() == 0; }
 
         // Element access (for debugging/small tensors)
@@ -60,6 +62,20 @@ namespace ma_core {
         Tensor to_device(Device target_device) const;
         void fill(scalar_t value);
         void zero();
+
+        // Bulk memory copy operations (host memory for now)
+        void copy_from(const void* src, size_t bytes) {
+            if (bytes != nbytes()) {
+                throw std::runtime_error("copy_from: size mismatch");
+            }
+            std::memcpy(data_.get(), src, bytes);
+        }
+        void copy_to(void* dst, size_t bytes) const {
+            if (bytes != nbytes()) {
+                throw std::runtime_error("copy_to: size mismatch");
+            }
+            std::memcpy(dst, data_.get(), bytes);
+        }
 
         // Shape operations
         Tensor reshape(const TensorShape& new_shape) const;

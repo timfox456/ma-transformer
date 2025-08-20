@@ -1,5 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <pybind11/numpy.h>
+#include <array>
 #include "ma_core.hpp"
 
 namespace py = pybind11;
@@ -54,10 +56,37 @@ PYBIND11_MODULE(ma_core, m) {
     // Tensor class (basic interface)
     py::class_<ma_core::Tensor>(m, "Tensor")
         .def("size", &ma_core::Tensor::size, "Total number of elements")
+        .def("nbytes", &ma_core::Tensor::nbytes, "Total number of bytes")
         .def("empty", &ma_core::Tensor::empty, "Check if tensor is empty")
         .def("shape", &ma_core::Tensor::shape, "Get tensor shape")
         .def("zero", &ma_core::Tensor::zero, "Fill tensor with zeros")
-        .def("fill", &ma_core::Tensor::fill, "Fill tensor with a value");
+        .def("fill", &ma_core::Tensor::fill, "Fill tensor with a value")
+        // Bulk copy from a contiguous NumPy array (float32)
+        .def("copy_from_numpy", [](ma_core::Tensor& t, py::array_t<float, py::array::c_style | py::array::forcecast> arr){
+                if (static_cast<size_t>(arr.size()) * sizeof(float) != t.nbytes()) {
+                    throw std::runtime_error("copy_from_numpy: size mismatch");
+                }
+                // Ensure C-contiguous
+                auto buf = arr.request();
+                t.copy_from(buf.ptr, t.nbytes());
+            }, py::arg("array"))
+        // Return a new NumPy array with the tensor contents (float32)
+        .def("to_numpy", [](const ma_core::Tensor& t){
+                const auto& s = t.shape();
+                std::array<py::ssize_t,4> shape = {static_cast<py::ssize_t>(s.batch_size),
+                                                   static_cast<py::ssize_t>(s.sequence_length),
+                                                   static_cast<py::ssize_t>(s.num_heads),
+                                                   static_cast<py::ssize_t>(s.head_dim)};
+                std::array<py::ssize_t,4> strides = {static_cast<py::ssize_t>(s.sequence_length * s.num_heads * s.head_dim * sizeof(float)),
+                                                     static_cast<py::ssize_t>(s.num_heads * s.head_dim * sizeof(float)),
+                                                     static_cast<py::ssize_t>(s.head_dim * sizeof(float)),
+                                                     static_cast<py::ssize_t>(sizeof(float))};
+                // Allocate a new array and copy
+                py::array_t<float> out(shape);
+                auto buf = out.request();
+                t.copy_to(buf.ptr, t.nbytes());
+                return out;
+            });
     
     // Device enum
     py::enum_<ma_core::Device>(m, "Device")
