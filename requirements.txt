@@ -5,3 +5,4 @@ scikit-learn
 pyyaml
 matplotlib
 pybind11
+pytest

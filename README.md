@@ -159,3 +159,39 @@ param_grid:
 └── tests/                    # Unit tests for custom kernels and model components
 ```
 
+## CUDA Extension Usage (current repo state)
+
+This repository includes optional CUDA forward kernels for attention that build as a PyTorch CUDA extension named `sparse_attention_cuda`. The Python bridge in `src/layers/ma_core_bridge.py` will automatically use these kernels when tensors are on CUDA and `float32`.
+
+Build the extensions (ensure your CUDA toolkit matches your installed PyTorch CUDA version):
+
+```
+pip install -e .
+# or
+python setup.py build_ext --inplace
+```
+
+Run CUDA parity tests (skips automatically if CUDA/ext missing):
+
+```
+pytest tests/integration/test_cuda_parity.py -q
+```
+
+Manual dense sanity check:
+
+```
+python - <<'PY'
+import torch
+from src.layers.ma_core_bridge import MACoreAttention, pytorch_dense_attention
+B,S,H,D=1,64,4,32
+q=k=v=torch.randn(B,S,H,D, device='cuda', dtype=torch.float32)
+m=MACoreAttention(sparse=False, use_causal_mask=False, fallback_training=False).eval()
+y=m(q,k,v)
+y_ref=pytorch_dense_attention(q,k,v, False)
+print('max abs diff:', (y-y_ref).abs().max().item())
+PY
+```
+
+Notes:
+- Only forward float32 is implemented in CUDA today; training/autograd remains in PyTorch.
+- CPU `ma_core` path (pybind11) is separate and currently CPU-only.

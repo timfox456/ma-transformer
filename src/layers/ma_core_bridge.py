@@ -10,6 +10,35 @@ import ma_core
 import numpy as np
 from typing import Optional, Tuple
 
+# Optional CUDA sparse attention extension
+import os
+import sys
+from pathlib import Path
+
+def _try_import_sparse_ext():
+    try:
+        import sparse_attention_cuda  # type: ignore  # built by setup.py when CUDA available
+        return sparse_attention_cuda
+    except Exception:
+        return None
+
+# First attempt: normal import from site-packages
+sparse_attention_cuda = _try_import_sparse_ext()
+_HAS_SPARSE_CUDA = sparse_attention_cuda is not None
+
+# Fallback: try to import from local build in src/ if present (editable dev)
+if not _HAS_SPARSE_CUDA:
+    try:
+        this_dir = Path(__file__).resolve().parent  # .../src/layers
+        src_dir = this_dir.parent  # .../src
+        if str(src_dir) not in sys.path:
+            sys.path.insert(0, str(src_dir))
+        sparse_attention_cuda = _try_import_sparse_ext()
+        _HAS_SPARSE_CUDA = sparse_attention_cuda is not None
+    except Exception:
+        sparse_attention_cuda = None
+        _HAS_SPARSE_CUDA = False
+
 
 class MACoreAttentionFunction(torch.autograd.Function):
     """
@@ -41,22 +70,45 @@ class MACoreAttentionFunction(torch.autograd.Function):
         ctx.window_size = window_size
         ctx.use_causal_mask = use_causal_mask
         
-        # Convert PyTorch tensors to ma_core tensors
-        batch_size, seq_len, num_heads, head_dim = query.shape
-        
-        # Create ma_core tensors with matching data
-        mc_query = pytorch_to_ma_core(query)
-        mc_key = pytorch_to_ma_core(key)
-        mc_value = pytorch_to_ma_core(value)
-        
-        # Compute attention using C++ engine
-        if sparse:
-            mc_output = ma_core.compute_sparse_attention(mc_query, mc_key, mc_value, window_size)
+        # CUDA fast-paths when extension is available
+        if _HAS_SPARSE_CUDA and query.is_cuda and key.is_cuda and value.is_cuda:
+            if sparse:
+                if query.dtype != torch.float32 or key.dtype != torch.float32 or value.dtype != torch.float32:
+                    # fall back if dtype unsupported
+                    output = pytorch_sparse_attention(query, key, value, window_size)
+                else:
+                    # Ensure contiguous for kernel access
+                    cq = query.contiguous()
+                    ck = key.contiguous()
+                    cv = value.contiguous()
+                    output = sparse_attention_cuda.forward(cq, ck, cv, int(window_size))
+            else:
+                if query.dtype != torch.float32 or key.dtype != torch.float32 or value.dtype != torch.float32:
+                    output = pytorch_dense_attention(query, key, value, use_causal_mask)
+                else:
+                    cq = query.contiguous()
+                    ck = key.contiguous()
+                    cv = value.contiguous()
+                    output = sparse_attention_cuda.dense_forward(cq, ck, cv, bool(use_causal_mask))
         else:
-            mc_output = ma_core.compute_dense_attention(mc_query, mc_key, mc_value, use_causal_mask)
-        
-        # Convert back to PyTorch tensor
-        output = ma_core_to_pytorch(mc_output, query.device, query.dtype)
+            # Prefer staying on-device if any tensor is non-CPU and we don't have a specialized path
+            any_non_cpu = (query.device.type != 'cpu' or key.device.type != 'cpu' or value.device.type != 'cpu')
+            if any_non_cpu:
+                if sparse:
+                    output = pytorch_sparse_attention(query, key, value, window_size)
+                else:
+                    output = pytorch_dense_attention(query, key, value, use_causal_mask)
+            else:
+                # CPU path through ma_core (pybind11 C++)
+                batch_size, seq_len, num_heads, head_dim = query.shape
+                mc_query = pytorch_to_ma_core(query)
+                mc_key = pytorch_to_ma_core(key)
+                mc_value = pytorch_to_ma_core(value)
+                if sparse:
+                    mc_output = ma_core.compute_sparse_attention(mc_query, mc_key, mc_value, window_size)
+                else:
+                    mc_output = ma_core.compute_dense_attention(mc_query, mc_key, mc_value, use_causal_mask)
+                output = ma_core_to_pytorch(mc_output, query.device, query.dtype)
         
         return output
     

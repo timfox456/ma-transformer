@@ -4,6 +4,29 @@ from setuptools.command.build_ext import build_ext
 import pybind11
 import sys
 
+# Optional: Torch CUDA extension for sparse attention (guarded)
+_has_torch = False
+_cuda_ext = None
+_cmdclass = {'build_ext': build_ext}
+try:
+    import torch  # noqa: F401
+    from torch.utils.cpp_extension import CUDAExtension, BuildExtension
+    from torch.utils.cpp_extension import CUDA_HOME
+    _has_torch = True
+    if CUDA_HOME is not None:
+        _cuda_ext = CUDAExtension(
+            name='sparse_attention_cuda',
+            sources=[
+                'src/cuda/sparse_attention_kernel.cu',
+                'src/cuda/dense_attention_kernel.cu',
+            ],
+            extra_compile_args={'cxx': ['-O3', '-std=c++17'], 'nvcc': ['-O3']},
+        )
+        _cmdclass = {'build_ext': BuildExtension}
+except Exception:
+    # Torch not available or no CUDA toolchain; skip CUDA extension
+    _has_torch = False
+
 
 # Pure C++ extension without PyTorch dependencies
 ext_modules = [
@@ -21,7 +44,10 @@ ext_modules = [
     )
 ]
 
+if _cuda_ext is not None:
+    ext_modules.append(_cuda_ext)
+
 setup(
     ext_modules=ext_modules,
-    cmdclass={'build_ext': build_ext}
+    cmdclass=_cmdclass,
 )
