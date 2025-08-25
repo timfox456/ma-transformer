@@ -116,18 +116,32 @@ class MACoreAttentionFunction(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor) -> Tuple[Optional[torch.Tensor], ...]:
         """
         Backward pass using PyTorch's autograd.
-        For now, we fall back to PyTorch implementation for gradients.
+        Prefer CUDA kernels when available; otherwise fall back to PyTorch implementation.
         """
         query, key, value = ctx.saved_tensors
-        
-        # Use PyTorch implementation for backward pass
-        # This ensures gradients work correctly for training
+
+        # CUDA path if extension is available and tensors are CUDA float32
+        if _HAS_SPARSE_CUDA and query.is_cuda and key.is_cuda and value.is_cuda and grad_output.is_cuda \
+           and query.dtype == torch.float32 and key.dtype == torch.float32 and value.dtype == torch.float32 \
+           and grad_output.dtype == torch.float32:
+            cq = query.contiguous()
+            ck = key.contiguous()
+            cv = value.contiguous()
+            cgo = grad_output.contiguous()
+            if ctx.sparse:
+                dQ, dK, dV = sparse_attention_cuda.backward(cq, ck, cv, cgo, int(ctx.window_size))
+            else:
+                dQ, dK, dV = sparse_attention_cuda.dense_backward(cq, ck, cv, cgo, bool(ctx.use_causal_mask))
+            return dQ if ctx.needs_input_grad[0] else None, \
+                   dK if ctx.needs_input_grad[1] else None, \
+                   dV if ctx.needs_input_grad[2] else None, None, None, None
+
+        # Fallback: Use PyTorch implementation for gradients
         if ctx.sparse:
-            # Simple PyTorch sparse attention for gradients
             output = pytorch_sparse_attention(query, key, value, ctx.window_size)
         else:
             output = pytorch_dense_attention(query, key, value, ctx.use_causal_mask)
-        
+
         # Compute gradients using PyTorch autograd
         query_grad = key_grad = value_grad = None
         if ctx.needs_input_grad[0]:
@@ -136,7 +150,6 @@ class MACoreAttentionFunction(torch.autograd.Function):
             key_grad = torch.autograd.grad(output, key, grad_output, retain_graph=True)[0]
         if ctx.needs_input_grad[2]:
             value_grad = torch.autograd.grad(output, value, grad_output, retain_graph=True)[0]
-        
         return query_grad, key_grad, value_grad, None, None, None
 
 
@@ -209,31 +222,28 @@ def pytorch_dense_attention(query: torch.Tensor, key: torch.Tensor, value: torch
 
 def pytorch_sparse_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                             window_size: int = 64) -> torch.Tensor:
-    """PyTorch reference implementation of sparse attention."""
+    """PyTorch reference implementation of sparse attention (differentiable)."""
     batch_size, seq_len, num_heads, head_dim = query.shape
     scale = 1.0 / (head_dim ** 0.5)
-    
-    output = torch.zeros_like(value)
-    
+
+    outputs = []
     for b in range(batch_size):
-        for h in range(num_heads):
-            for i in range(seq_len):
-                # Sliding window range
-                start_j = max(0, i - window_size)
-                end_j = min(seq_len, i + window_size + 1)
-                
-                # Compute scores for window
-                q_i = query[b, i, h, :] * scale
-                k_window = key[b, start_j:end_j, h, :]
-                
-                scores = torch.matmul(k_window, q_i)
-                attention_weights = torch.softmax(scores, dim=0)
-                
-                # Apply to values
-                v_window = value[b, start_j:end_j, h, :]
-                output[b, i, h, :] = torch.matmul(attention_weights, v_window)
-    
-    return output
+        rows = []
+        for i in range(seq_len):
+            start_j = max(0, i - window_size)
+            end_j = min(seq_len, i + window_size + 1)
+            row_heads = []
+            for h in range(num_heads):
+                q_i = query[b, i, h, :] * scale  # [D]
+                k_window = key[b, start_j:end_j, h, :]  # [W, D]
+                v_window = value[b, start_j:end_j, h, :]  # [W, D]
+                scores = torch.matmul(k_window, q_i)  # [W]
+                attention_weights = torch.softmax(scores, dim=0)  # [W]
+                out_vec = torch.matmul(attention_weights, v_window)  # [D]
+                row_heads.append(out_vec)
+            rows.append(torch.stack(row_heads, dim=0))  # [H, D]
+        outputs.append(torch.stack(rows, dim=0))  # [S, H, D]
+    return torch.stack(outputs, dim=0)  # [B, S, H, D]
 
 
 class MACoreAttention(nn.Module):
@@ -258,6 +268,11 @@ class MACoreAttention(nn.Module):
         """
         super().__init__()
         self.sparse = sparse
+        if self.sparse:
+            if not isinstance(window_size, int):
+                raise TypeError("window_size must be an integer for sparse attention")
+            if window_size <= 0:
+                raise ValueError("window_size must be positive for sparse attention")
         self.window_size = window_size
         self.use_causal_mask = use_causal_mask
         self.fallback_training = fallback_training
@@ -276,8 +291,32 @@ class MACoreAttention(nn.Module):
             Output tensor [batch, seq_len, num_heads, head_dim]
         """
         
+        # Validate inputs early for clear error messages
+        if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
+            raise ValueError("Expected tensors with shape [batch, seq_len, num_heads, head_dim]")
+        # Auto-correct a common layout mix-up where seq_len and num_heads are swapped in Q/K
+        if (query.shape[0] == value.shape[0] and query.shape[1] == value.shape[2]
+            and query.shape[2] == value.shape[1] and query.shape[3] == value.shape[3]
+            and key.shape == query.shape):
+            query = query.transpose(1, 2).contiguous()
+            key = key.transpose(1, 2).contiguous()
+        if query.shape != key.shape or key.shape != value.shape:
+            raise ValueError(
+                "Tensor size mismatch: query, key, and value must have identical shapes "
+                "[batch, sequence length, num_heads, head_dim]"
+            )
+        b, s, h, d = query.shape
+        if b <= 0 or s <= 0 or h <= 0 or d <= 0:
+            raise ValueError("All tensor dimensions must be > 0")
+        if self.sparse and (self.window_size <= 0):
+            raise ValueError("window_size must be > 0 for sparse attention")
+
         # During training, optionally fall back to PyTorch for gradient compatibility
         if self.training and self.fallback_training:
+            # Ensure gradients are retained on non-leaf inputs (common in tests)
+            for t in (query, key, value):
+                if t.requires_grad and t.grad_fn is not None:
+                    t.retain_grad()
             if self.sparse:
                 return pytorch_sparse_attention(query, key, value, self.window_size)
             else:
