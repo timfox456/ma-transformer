@@ -272,8 +272,9 @@ class MACoreAttention(nn.Module):
         if self.sparse:
             if not isinstance(window_size, int):
                 raise TypeError("window_size must be an integer for sparse attention")
-            if window_size <= 0:
-                raise ValueError("window_size must be positive for sparse attention")
+            # Allow window_size == 0 (self-only attention); disallow negatives
+            if window_size < 0:
+                raise ValueError("window_size must be >= 0 for sparse attention")
         self.window_size = window_size
         self.use_causal_mask = use_causal_mask
         self.fallback_training = fallback_training

@@ -431,9 +431,10 @@ torch::Tensor sparse_forward_cuda(torch::Tensor query,
 
     float scale = 1.0f / std::sqrt(static_cast<float>(D));
 
-    unsigned int block_x = static_cast<unsigned int>(std::min<int64_t>(S, 128));
-    dim3 block(block_x);
-    dim3 grid( static_cast<unsigned int>((S + block.x - 1) / block.x),
+    // Use a warp-per-row mapping: one warp (32 threads) computes a row i
+    // This aligns with kernel's expectation of i = blockIdx.x and lane = threadIdx.x & 31
+    dim3 block(32);
+    dim3 grid( static_cast<unsigned int>(S),
                static_cast<unsigned int>(H),
                static_cast<unsigned int>(B) );
     auto stream = at::cuda::getCurrentCUDAStream();
