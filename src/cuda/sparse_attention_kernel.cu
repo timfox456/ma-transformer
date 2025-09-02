@@ -25,7 +25,7 @@ __inline__ __device__ float warp_allreduce_max(float val) {
 
 namespace {
 
-inline int64_t idx4(int64_t b, int64_t i, int64_t h, int64_t d,
+__device__ __forceinline__ int64_t idx4(int64_t b, int64_t i, int64_t h, int64_t d,
                     int64_t B, int64_t S, int64_t H, int64_t D) {
     // Layout: [B, S, H, D] with D contiguous
     return (((b * S + i) * H + h) * D + d);
@@ -33,6 +33,7 @@ inline int64_t idx4(int64_t b, int64_t i, int64_t h, int64_t d,
 
 // Optimized dense attention forward: one warp computes one (b,h,i) row.
 // Online softmax keeps numerical stability without storing full score matrix.
+// Minor SIMT optimizations: use FMA in dot-product and unroll hints.
 template <typename T>
 __global__ void dense_attention_forward_warp(
     const T* __restrict__ Q,
@@ -66,10 +67,16 @@ __global__ void dense_attention_forward_warp(
     for (int64_t j = 0; j < j_end; ++j) {
         // Compute dot(Q_i, K_j) across warp
         float dot = 0.f;
+        // Unroll a bit to help compiler schedule memory ops
+        #pragma unroll 4
         for (int64_t d = lane; d < D; d += 32) {
-            dot += (float)Q[idx4(b, i, h, d, B, S, H, D)] * (float)K[idx4(b, j, h, d, B, S, H, D)];
+            float qv = (float)Q[idx4(b, i, h, d, B, S, H, D)];
+            float kv = (float)K[idx4(b, j, h, d, B, S, H, D)];
+            dot = fmaf(qv, kv, dot);
         }
         dot = warp_allreduce_sum(dot);
+        // Broadcast the sum to all threads in the warp
+        dot = __shfl_sync(0xffffffff, dot, 0);
         dot *= (float)scale;
 
         // Online softmax update
@@ -81,6 +88,7 @@ __global__ void dense_attention_forward_warp(
         float beta  = expf(dot - m_new) / l_new;
 
         // Update accumulator O_row = alpha * O_row + beta * V_j
+        #pragma unroll 4
         for (int64_t d = lane; d < D; d += 32) {
             float prev = (float)O[idx4(b, i, h, d, B, S, H, D)];
             float vval = (float)V[idx4(b, j, h, d, B, S, H, D)];
@@ -221,8 +229,8 @@ __global__ void sparse_attention_forward_warp(
         O[idx4(b, i, h, d, B, S, H, D)] = (T)0;
     }
 
-    const int64_t start_j = max<int64_t>(0, i - window);
-    const int64_t end_j   = min<int64_t>(S, i + window + 1);
+    const int64_t start_j = (0 > (i - window)) ? 0 : (i - window);
+    const int64_t end_j   = (S < (i + window + 1)) ? S : (i + window + 1);
 
     float m_i = -INFINITY;
     float l_i = 0.f;
@@ -233,6 +241,8 @@ __global__ void sparse_attention_forward_warp(
             dot += (float)Q[idx4(b, i, h, d, B, S, H, D)] * (float)K[idx4(b, j, h, d, B, S, H, D)];
         }
         dot = warp_allreduce_sum(dot);
+        // Broadcast the sum to all threads in the warp
+        dot = __shfl_sync(0xffffffff, dot, 0);
         dot *= (float)scale;
 
         float m_new = fmaxf(m_i, dot);
@@ -270,8 +280,8 @@ __global__ void sparse_attention_backward_kernel(
     int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= S) return;
 
-    int64_t start_j = max<int64_t>(0, i - window);
-    int64_t end_j = min<int64_t>(S, i + window + 1);
+    int64_t start_j = (0 > (i - window)) ? 0 : (i - window);
+    int64_t end_j = (S < (i + window + 1)) ? S : (i + window + 1);
 
     // 1) Recompute softmax probs within window
     T max_score = -std::numeric_limits<T>::infinity();
