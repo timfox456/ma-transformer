@@ -9,6 +9,19 @@
 #include <limits>
 #include <algorithm>
 
+// Simple warp-level reductions for float
+__inline__ __device__ float warp_allreduce_sum(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    return val;
+}
+
+__inline__ __device__ float warp_allreduce_max(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+    return val;
+}
+
 namespace {
 
 inline int64_t idx4(int64_t b, int64_t i, int64_t h, int64_t d,
@@ -17,8 +30,10 @@ inline int64_t idx4(int64_t b, int64_t i, int64_t h, int64_t d,
     return (((b * S + i) * H + h) * D + d);
 }
 
+// Optimized dense attention forward: one warp computes one (b,h,i) row.
+// Online softmax keeps numerical stability without storing full score matrix.
 template <typename T>
-__global__ void dense_attention_kernel(
+__global__ void dense_attention_forward_warp(
     const T* __restrict__ Q,
     const T* __restrict__ K,
     const T* __restrict__ V,
@@ -26,49 +41,54 @@ __global__ void dense_attention_kernel(
     int64_t B, int64_t S, int64_t H, int64_t D,
     T scale, bool causal)
 {
-    // One thread computes one (b, h, i) row of attention
-    int64_t b = blockIdx.z;
-    int64_t h = blockIdx.y;
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    // Map grid to (b, h, i)
+    const int64_t b = blockIdx.z;
+    const int64_t h = blockIdx.y;
+    const int64_t i = blockIdx.x; // one warp per row
     if (i >= S) return;
 
-    // 1) find max score over j
-    T max_score = -std::numeric_limits<T>::infinity();
-    for (int64_t j = 0; j < S; ++j) {
-        if (causal && j > i) break; // scores after i are masked
-        T s = 0;
-        for (int64_t d = 0; d < D; ++d) {
-            s += Q[idx4(b,i,h,d,B,S,H,D)] * K[idx4(b,j,h,d,B,S,H,D)];
-        }
-        s *= scale;
-        if (s > max_score) max_score = s;
+    // lane id within warp
+    const int lane = threadIdx.x & 31;
+
+    // Online softmax variables (shared across warp)
+    float m_i = -INFINITY; // running max
+    float l_i = 0.f;       // running sum of exp
+
+    // Accumulator for output vector: each lane owns a slice of D: d = lane, lane+32, ...
+    for (int64_t d = lane; d < D; d += 32) {
+        O[idx4(b, i, h, d, B, S, H, D)] = (T)0;
     }
 
-    // 2) compute sum_exp
-    T sum_exp = 0;
-    int64_t j_limit = causal ? (i + 1) : S;
-    for (int64_t j = 0; j < j_limit; ++j) {
-        T s = 0;
-        for (int64_t d = 0; d < D; ++d) {
-            s += Q[idx4(b,i,h,d,B,S,H,D)] * K[idx4(b,j,h,d,B,S,H,D)];
-        }
-        s = expf((float)(s * scale - max_score));
-        sum_exp += s;
-    }
-    if (sum_exp == (T)0) sum_exp = (T)1; // guard against division by zero
+    const int64_t j_end = causal ? (i + 1) : S;
 
-    // 3) accumulate output = softmax(scores) @ V
-    for (int64_t d = 0; d < D; ++d) {
-        T acc = 0;
-        for (int64_t j = 0; j < j_limit; ++j) {
-            T s = 0;
-            for (int64_t k = 0; k < D; ++k) {
-                s += Q[idx4(b,i,h,k,B,S,H,D)] * K[idx4(b,j,h,k,B,S,H,D)];
-            }
-            s = expf((float)(s * scale - max_score)) / sum_exp;
-            acc += s * V[idx4(b,j,h,d,B,S,H,D)];
+    // Iterate over keys j
+    for (int64_t j = 0; j < j_end; ++j) {
+        // Compute dot(Q_i, K_j) across warp
+        float dot = 0.f;
+        for (int64_t d = lane; d < D; d += 32) {
+            dot += (float)Q[idx4(b, i, h, d, B, S, H, D)] * (float)K[idx4(b, j, h, d, B, S, H, D)];
         }
-        O[idx4(b,i,h,d,B,S,H,D)] = acc;
+        dot = warp_allreduce_sum(dot);
+        dot *= (float)scale;
+
+        // Online softmax update
+        float m_new = fmaxf(m_i, dot);
+        float l_new = l_i * expf(m_i - m_new) + expf(dot - m_new);
+
+        // Compute coefficients to update accumulated output
+        float alpha = (l_i == 0.f) ? 0.f : (l_i * expf(m_i - m_new) / l_new);
+        float beta  = expf(dot - m_new) / l_new;
+
+        // Update accumulator O_row = alpha * O_row + beta * V_j
+        for (int64_t d = lane; d < D; d += 32) {
+            float prev = (float)O[idx4(b, i, h, d, B, S, H, D)];
+            float vval = (float)V[idx4(b, j, h, d, B, S, H, D)];
+            float out = alpha * prev + beta * vval;
+            O[idx4(b, i, h, d, B, S, H, D)] = (T)out;
+        }
+
+        m_i = m_new;
+        l_i = l_new;
     }
 }
 
@@ -166,10 +186,9 @@ __global__ void dense_attention_backward_kernel(
 
         // dQ_i += (dScores * scale) * K_j
         for (int64_t k = 0; k < D; ++k) {
-            // unique writer per i
+            // unique writer per (b,i,h,k) in this kernel mapping; no atomic needed
             T val = dScores * scale * K[idx4(b,j,h,k,B,S,H,D)];
-            // accumulate locally then write (no race for (b,i,h,k))
-            atomicAdd(&dQ[idx4(b,i,h,k,B,S,H,D)], val);
+            dQ[idx4(b,i,h,k,B,S,H,D)] += val;
         }
 
         // dK_j += (dScores * scale) * Q_i (requires atomics across i)
@@ -179,8 +198,9 @@ __global__ void dense_attention_backward_kernel(
     }
 }
 
+// Optimized sparse (sliding window) attention forward: warp-per-row online softmax.
 template <typename T>
-__global__ void sparse_attention_kernel(
+__global__ void sparse_attention_forward_warp(
     const T* __restrict__ Q,
     const T* __restrict__ K,
     const T* __restrict__ V,
@@ -188,50 +208,46 @@ __global__ void sparse_attention_kernel(
     int64_t B, int64_t S, int64_t H, int64_t D,
     int64_t window, T scale)
 {
-    // One thread computes one (b, h, i)
-    int64_t b = blockIdx.z;
-    int64_t h = blockIdx.y;
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t b = blockIdx.z;
+    const int64_t h = blockIdx.y;
+    const int64_t i = blockIdx.x; // one warp per row
     if (i >= S) return;
 
-    int64_t start_j = max<int64_t>(0, i - window);
-    int64_t end_j = min<int64_t>(S, i + window + 1);
+    const int lane = threadIdx.x & 31;
 
-    // 1) find max
-    T max_score = -std::numeric_limits<T>::infinity();
-    for (int64_t j = start_j; j < end_j; ++j) {
-        T s = 0;
-        for (int64_t d = 0; d < D; ++d) {
-            s += Q[idx4(b,i,h,d,B,S,H,D)] * K[idx4(b,j,h,d,B,S,H,D)];
-        }
-        s *= scale;
-        if (s > max_score) max_score = s;
+    // Initialize output accumulator to zeros for each lane's slice
+    for (int64_t d = lane; d < D; d += 32) {
+        O[idx4(b, i, h, d, B, S, H, D)] = (T)0;
     }
 
-    // 2) sum_exp
-    T sum_exp = 0;
-    for (int64_t j = start_j; j < end_j; ++j) {
-        T s = 0;
-        for (int64_t d = 0; d < D; ++d) {
-            s += Q[idx4(b,i,h,d,B,S,H,D)] * K[idx4(b,j,h,d,B,S,H,D)];
-        }
-        s = expf((float)(s * scale - max_score));
-        sum_exp += s;
-    }
-    if (sum_exp == (T)0) sum_exp = (T)1;
+    const int64_t start_j = max<int64_t>(0, i - window);
+    const int64_t end_j   = min<int64_t>(S, i + window + 1);
 
-    // 3) output
-    for (int64_t d = 0; d < D; ++d) {
-        T acc = 0;
-        for (int64_t j = start_j; j < end_j; ++j) {
-            T s = 0;
-            for (int64_t k = 0; k < D; ++k) {
-                s += Q[idx4(b,i,h,k,B,S,H,D)] * K[idx4(b,j,h,k,B,S,H,D)];
-            }
-            s = expf((float)(s * scale - max_score)) / sum_exp;
-            acc += s * V[idx4(b,j,h,d,B,S,H,D)];
+    float m_i = -INFINITY;
+    float l_i = 0.f;
+
+    for (int64_t j = start_j; j < end_j; ++j) {
+        float dot = 0.f;
+        for (int64_t d = lane; d < D; d += 32) {
+            dot += (float)Q[idx4(b, i, h, d, B, S, H, D)] * (float)K[idx4(b, j, h, d, B, S, H, D)];
         }
-        O[idx4(b,i,h,d,B,S,H,D)] = acc;
+        dot = warp_allreduce_sum(dot);
+        dot *= (float)scale;
+
+        float m_new = fmaxf(m_i, dot);
+        float l_new = l_i * expf(m_i - m_new) + expf(dot - m_new);
+        float alpha = (l_i == 0.f) ? 0.f : (l_i * expf(m_i - m_new) / l_new);
+        float beta  = expf(dot - m_new) / l_new;
+
+        for (int64_t d = lane; d < D; d += 32) {
+            float prev = (float)O[idx4(b, i, h, d, B, S, H, D)];
+            float vval = (float)V[idx4(b, j, h, d, B, S, H, D)];
+            float out = alpha * prev + beta * vval;
+            O[idx4(b, i, h, d, B, S, H, D)] = (T)out;
+        }
+
+        m_i = m_new;
+        l_i = l_new;
     }
 }
 
@@ -311,7 +327,8 @@ __global__ void sparse_attention_backward_kernel(
         T dScores = (dP - s_dot) * P;
 
         for (int64_t k = 0; k < D; ++k) {
-            atomicAdd(&dQ[idx4(b,i,h,k,B,S,H,D)], dScores * scale * K[idx4(b,j,h,k,B,S,H,D)]);
+            // unique writer for dQ element; atomics still required for dK across i
+            dQ[idx4(b,i,h,k,B,S,H,D)] += dScores * scale * K[idx4(b,j,h,k,B,S,H,D)];
             atomicAdd(&dK[idx4(b,j,h,k,B,S,H,D)], dScores * scale * Q[idx4(b,i,h,k,B,S,H,D)]);
         }
     }
@@ -338,14 +355,14 @@ torch::Tensor dense_forward_cuda(torch::Tensor query,
 
     float scale = 1.0f / std::sqrt(static_cast<float>(D));
 
-    unsigned int block_x = static_cast<unsigned int>(std::min<int64_t>(S, 128));
-    dim3 block(block_x);
-    dim3 grid( static_cast<unsigned int>((S + block.x - 1) / block.x),
+    // One warp (32 threads) per (b,h,i) row for good parallelism and coalesced access.
+    dim3 block(32);
+    dim3 grid( static_cast<unsigned int>(S),
                static_cast<unsigned int>(H),
                static_cast<unsigned int>(B) );
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    dense_attention_kernel<float><<<grid, block, 0, stream.stream()>>>(
+    dense_attention_forward_warp<float><<<grid, block, 0, stream.stream()>>>(
         query.data_ptr<float>(), key.data_ptr<float>(), value.data_ptr<float>(),
         out.data_ptr<float>(), B, S, H, D, scale, use_causal_mask);
 
@@ -377,9 +394,8 @@ std::vector<torch::Tensor> dense_backward_cuda(torch::Tensor query,
 
     float scale = 1.0f / std::sqrt(static_cast<float>(D));
 
-    unsigned int block_x = static_cast<unsigned int>(std::min<int64_t>(S, 128));
-    dim3 block(block_x);
-    dim3 grid( static_cast<unsigned int>((S + block.x - 1) / block.x),
+    dim3 block(32);
+    dim3 grid( static_cast<unsigned int>(S),
                static_cast<unsigned int>(H),
                static_cast<unsigned int>(B) );
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -421,7 +437,7 @@ torch::Tensor sparse_forward_cuda(torch::Tensor query,
                static_cast<unsigned int>(B) );
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    sparse_attention_kernel<float><<<grid, block, 0, stream.stream()>>>(
+    sparse_attention_forward_warp<float><<<grid, block, 0, stream.stream()>>>(
         query.data_ptr<float>(), key.data_ptr<float>(), value.data_ptr<float>(),
         out.data_ptr<float>(), B, S, H, D, window_size, scale);
 
