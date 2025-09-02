@@ -31,6 +31,10 @@ class SparseAttention(nn.Module):
     """
     def __init__(self, window_size=3, use_ma_core=True):
         super(SparseAttention, self).__init__()
+        if not isinstance(window_size, int):
+            raise TypeError("window_size must be an integer for SparseAttention")
+        if window_size <= 0:
+            raise ValueError("window_size must be > 0 for SparseAttention")
         self.window_size = window_size
         self.use_ma_core = use_ma_core
         
