@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "attention_interface.hpp"
 #include <memory>
 #include <stdexcept>

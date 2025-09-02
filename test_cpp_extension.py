@@ -1,3 +1,4 @@
+ # SPDX-License-Identifier: Apache-2.0
 import ma_core
 
 result = ma_core.add(1, 2)

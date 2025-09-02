@@ -1,3 +1,4 @@
+ # SPDX-License-Identifier: Apache-2.0
 import pytest
 import torch
 
@@ -40,4 +41,3 @@ def test_sparse_cpu_matches_pytorch(B, S, H, D, W):
     y_ref = pytorch_sparse_attention(q, k, v, window_size=W)
 
     torch.testing.assert_close(y_cpu, y_ref, rtol=1e-5, atol=1e-6)
-

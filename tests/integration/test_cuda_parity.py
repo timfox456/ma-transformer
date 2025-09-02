@@ -1,3 +1,4 @@
+ # SPDX-License-Identifier: Apache-2.0
 import pytest
 import torch
 
@@ -54,4 +55,3 @@ def test_sparse_cuda_matches_pytorch(B, S, H, D, W):
 
     diff = max_abs_diff(y_cuda, y_ref)
     assert diff < 1e-4, f"sparse CUDA parity failed (max diff {diff})"
-

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 Test the actual attention computation functionality.
 Tests both dense and sparse attention implementations.

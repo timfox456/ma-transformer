@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 Benchmark ma_core attention vs PyTorch implementation.
 Compare performance and correctness of both dense and sparse attention.

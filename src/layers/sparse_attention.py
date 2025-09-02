@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 
 import torch
 import torch.nn as nn
@@ -103,4 +104,3 @@ class SparseAttention(nn.Module):
         output = torch.matmul(attn_weights, v)
         
         return output
-

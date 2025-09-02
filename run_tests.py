@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 Automated test runner for ma_transformer project.
 Runs both C++ and Python tests with comprehensive reporting.

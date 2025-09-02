@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 Test PyTorch integration with ma_core C++ engine.
 Verifies that the bridge works correctly and gradients flow properly.

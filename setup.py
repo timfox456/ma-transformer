@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext

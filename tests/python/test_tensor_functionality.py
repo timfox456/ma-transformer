@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 Comprehensive test suite for tensor and sparse attention functionality.
 Tests the extended C++ core engine capabilities.

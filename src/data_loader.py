@@ -1,4 +1,5 @@
-
+# SPDX-License-Identifier: Apache-2.0
+ 
 import torch
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd

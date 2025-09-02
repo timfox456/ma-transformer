@@ -1,3 +1,4 @@
+ # SPDX-License-Identifier: Apache-2.0
 import os
 import pytest
 import torch
@@ -27,4 +28,3 @@ def test_sparse_attention_cuda_matches_pytorch():
     out_ref = pytorch_sparse_attention(q, k, v, W)
 
     assert torch.allclose(out_cuda, out_ref, atol=1e-3, rtol=1e-3)
-

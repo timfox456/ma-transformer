@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Setup NVIDIA driver and CUDA toolkit on Ubuntu 24.04 (noble) for T4
 # - Installs latest recommended NVIDIA driver via ubuntu-drivers
 # - Installs CUDA Toolkit 12.1 from Ubuntu repositories
@@ -51,4 +52,3 @@ echo "== Done =="
 echo "- Reboot the system to load the NVIDIA driver: sudo reboot"
 echo "- After reboot, verify: nvidia-smi and nvcc --version"
 echo "- Then reinstall PyTorch CUDA wheels matching CUDA 12.1 and rebuild the project"
-

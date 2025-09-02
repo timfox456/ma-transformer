@@ -1,3 +1,4 @@
+ # SPDX-License-Identifier: Apache-2.0
 """
 pytest configuration and fixtures for integration tests.
 Provides common test utilities for PyTorch bridge testing.

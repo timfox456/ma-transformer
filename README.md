@@ -1,5 +1,7 @@
 # ma-transformer: Microstructure-Aware Transformer for Order Book Imbalance Prediction
 
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 ## Project Overview
 
 `ma-transformer` is an ambitious project focused on developing an ultra-low latency, GPU-accelerated deep learning framework for predicting order book imbalances and short-term price movements in high-frequency financial markets. At its core, this project leverages the power of NVIDIA CUDA to implement highly optimized, custom Transformer components, specifically tailored for the unique characteristics of tick-level market data.
@@ -195,3 +197,8 @@ PY
 Notes:
 - Only forward float32 is implemented in CUDA today; training/autograd remains in PyTorch.
 - CPU `ma_core` path (pybind11) is separate and currently CPU-only.
+
+## License
+
+This project is licensed under the Apache License, Version 2.0.
+See the `LICENSE` file for details and the `NOTICE` file for attribution.

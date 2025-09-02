@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // CUDA implementation for dense and sparse attention forward/backward paths
 // Exposed as a single Torch extension module: sparse_attention_cuda
 

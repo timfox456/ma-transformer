@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 Test script for new tensor and sparse attention functionality.
 This demonstrates the expanded capabilities before updating the main test suite.

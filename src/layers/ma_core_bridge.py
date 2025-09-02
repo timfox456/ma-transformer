@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 PyTorch bridge for ma_core C++ attention engine.
 Provides seamless integration between PyTorch tensors and ma_core tensors.

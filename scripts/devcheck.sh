@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 
 echo "== NVIDIA driver / NVML =="
@@ -44,4 +45,3 @@ if ! command -v nvcc >/dev/null 2>&1; then
   echo "  sudo apt-get update && sudo apt-get install -y cuda-toolkit-12-1"
 fi
 echo "- For PyTorch with CUDA 12.1: pip/uv install --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio"
-

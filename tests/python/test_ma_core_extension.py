@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 Comprehensive Python unit tests for the ma_core C++ extension.
 Tests both functionality and integration between Python and C++.

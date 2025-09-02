@@ -8,6 +8,10 @@ version = "0.1.0"
 description = "A project to build a low-latency transformer for financial markets."
 readme = "README.md"
 requires-python = ">=3.8"
+license = { file = "LICENSE" }
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+]
 dependencies = [
     "torch",
     "pandas",
@@ -17,3 +21,6 @@ dependencies = [
     "matplotlib",
     "pytest",
 ]
+
+[tool.setuptools]
+license-files = ["LICENSE", "NOTICE"]

@@ -1,3 +1,4 @@
+ # SPDX-License-Identifier: Apache-2.0
 """
 Integration tests for PyTorch compatibility and model integration.
 Tests the SparseAttention class and full model integration scenarios.

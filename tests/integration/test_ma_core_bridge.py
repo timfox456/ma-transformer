@@ -1,3 +1,4 @@
+ # SPDX-License-Identifier: Apache-2.0
 """
 Integration tests for ma_core PyTorch bridge functionality.
 Tests the bridge between C++ ma_core engine and PyTorch tensors.

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 Example usage of ma_core C++ engine with PyTorch integration.
 Demonstrates how to use the high-performance attention in existing PyTorch models.

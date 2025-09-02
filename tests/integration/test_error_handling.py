@@ -1,3 +1,4 @@
+ # SPDX-License-Identifier: Apache-2.0
 """
 Error handling and edge case tests for ma_core PyTorch integration.
 Tests robustness and proper error reporting.
