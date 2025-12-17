@@ -17,6 +17,7 @@ models/
 
 # Output files
 *.png
+!docs/*.png  # Exception: keep documentation graphics
 *.pdf
 *.aux
 *.out
