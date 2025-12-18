@@ -25,9 +25,29 @@
 
 **Target Audience:** Quantitative trading firms, market makers, and proprietary trading desks requiring sub-5ms inference latency with extended sequence lengths for capturing market microstructure dynamics.
 
-## The Problem Solved
+## The Problem Solved: From O(n²) to O(n·w)
 
-Traditional deep learning frameworks, while powerful, often introduce unacceptable latency when applied directly to the demanding environment of HFT. Specifically, standard Transformer architectures, with their quadratic complexity ($O(L^2)$) in self-attention, become a bottleneck when processing long sequences of tick data. `ma-transformer` addresses this by implementing:
+Traditional deep learning frameworks, while powerful, often introduce unacceptable latency when applied directly to the demanding environment of HFT. Specifically, standard Transformer architectures, with their **quadratic complexity** in self-attention, become a bottleneck when processing long sequences of tick data.
+
+### Standard Dense Attention: O(n²) Complexity
+
+$$
+\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V
+$$
+
+The bottleneck: computing the $n \times n$ attention matrix $QK^T$ requires $O(n^2)$ operations and memory.
+
+### Sparse Attention: O(n·w) Complexity
+
+By restricting each query to attend only to a **sliding window** of $w$ keys (exploiting temporal locality in market data):
+
+$$
+\text{SparseAttention}(Q, K, V)_i = \sum_{j \in \text{Window}(i, w)} \text{softmax}_j\left(\frac{Q_i K_j^T}{\sqrt{d_k}}\right)V_j
+$$
+
+**Result:** Complexity reduced from $O(n^2)$ to $O(n \cdot w)$ where $w \ll n$ (typically $w = 32\text{-}64$ for tick data).
+
+`ma-transformer` implements this sparse attention with custom CUDA kernels that exploit:
 
 * **Custom Sparse Self-Attention Kernels:** To reduce computational complexity from quadratic to near-linear, optimized for the temporal locality inherent in financial time series.
 * **GPU-Native Feature Engineering:** Processing raw tick data and extracting microstructure features directly on the GPU, minimizing host-device transfers.
