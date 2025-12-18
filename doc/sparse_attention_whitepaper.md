@@ -88,8 +88,9 @@ The choice of the set $S_i$ for each token $i$ defines the "sparsity pattern." S
 For many types of data (text, time series, images), nearby tokens are the most relevant. Sliding window attention formalizes this by allowing each token to attend only to its neighbors within a fixed window size $w$.
 
 The set of attended indices for token $i$ is:
+
 $$
-S_i = \{j \mid |i - j| \le w \}
+S_i = \\{j \mid |i - j| \le w \\}
 $$
 
 This is highly efficient, as each token only computes $2w+1$ attention scores. The complexity is $\mathcal{O}(n \cdot w)$, which is linear in $n$ if $w$ is constant.
@@ -100,7 +101,7 @@ A limitation of the simple sliding window is that the receptive field is limited
 
 With a dilation factor $d$ and a window size $w$, the set of attended indices is:
 $$
-S_i = \{j \mid j = i - k \cdot d, \text{ for } k \in [-w, w] \}
+S_i = \\{j \mid j = i - k \cdot d, \text{ for } k \in [-w, w] \\}
 $$
 
 This allows the model to see further back in the sequence with the same computational cost as a standard sliding window.
@@ -112,13 +113,15 @@ Some tokens in a sequence have broad, summary-level importance (e.g., the `[CLS]
 In this pattern, we pre-select a small number of tokens to have "global" attention. Let $G$ be the set of global token indices.
 
 The full set of attended indices $S_i$ for a token $i$ is a union of its local window and the global tokens:
+
 $$
-S_i = \{j \mid |i - j| \le w \} \cup G
+S_i = \\{j \mid |i - j| \le w \\} \cup G
 $$
 
 For a global token $i \in G$, its attention is dense:
+
 $$
-S_i = \{j \mid 1 \le j \le n\}
+S_i = \\{j \mid 1 \le j \le n\\}
 $$
 
 Models like the Longformer combine a sliding window with global attention on a few key tokens, achieving a balance between local context and global information integration.
