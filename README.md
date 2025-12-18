@@ -12,10 +12,10 @@
 |--------|----------------------|-------------------------|-----------|
 | **Memory** | 64.2 GB | 0.25 GB | **99.6% reduction** |
 | **Computation** | 4,398 GFLOPs | 4.3 GFLOPs | **1,000x less compute** |
-| **Latency** | ~15+ seconds | ~3.4 seconds | **4-5x faster** |
 | **Feasibility** | ❌ Impractical (OOM on 16GB GPU) | ✅ Runs on consumer hardware |
+| **Latency** | TBD (CUDA benchmarks) | TBD (CUDA benchmarks) | **Subquadratic scaling** |
 
-**Key Insight:** Dense attention's O(n²) complexity becomes **completely impractical** for production HFT sequences. At 64K ticks (a typical morning session), dense attention requires 64GB memory and 15+ seconds—making real-time inference impossible. Sparse attention's O(n·w) complexity enables the same inference with <1GB memory and sub-5s latency.
+**Key Insight:** Dense attention's O(n²) complexity becomes **completely impractical** for production HFT sequences. At 64K ticks (a typical morning session), dense attention requires 64GB memory—making real-time inference impossible. Sparse attention's O(n·w) complexity enables the same inference with <1GB memory and 1,000x less computation.
 
 > **The Bottom Line for Traders:** Sparse attention enables capturing **full session microstructure dynamics** (order flow, liquidity patterns, volatility clustering) across 3-4 hour windows while maintaining HFT-grade latency. Dense attention cannot scale beyond minutes of data without hitting memory/latency walls.
 
@@ -51,9 +51,9 @@ Standard frameworks use generalized memory patterns. HFT tick data has **extreme
 Financial microstructure features (order flow imbalance, volume-weighted metrics) require custom preprocessing. Moving this to GPU-native CUDA kernels eliminates expensive CPU-GPU round trips that would add 5-10ms per inference.
 
 ### 5. **Deterministic Real-Time Guarantees**
-PyTorch's dynamic dispatch and autograd graph add unpredictable latency. Custom CUDA inference paths provide **deterministic <5ms latency** with zero graph overhead.
+PyTorch's dynamic dispatch and autograd graph add unpredictable latency. Custom CUDA inference paths provide **deterministic low-latency** with zero graph overhead.
 
-**The Tradeoff:** Development complexity vs. production performance. For HFT applications where microseconds matter and infrastructure costs scale with latency, custom CUDA delivers 3-4x improvement that directly translates to P&L.
+**The Tradeoff:** Development complexity vs. production performance. For HFT applications where microseconds matter and infrastructure costs scale with latency, custom CUDA delivers substantial performance improvements that directly translate to P&L.
 
 ## Key Features & Goals
 
