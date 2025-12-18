@@ -289,11 +289,11 @@ def main():
     fig = generate_64k_theoretical_chart(include_timing_panel=INCLUDE_TIMING_PANEL)
 
     # Save to docs/ directory only (binary artifact checked into git)
-    output_path = Path(__file__).parent / 'docs' / 'sparse_attention_64k_scaling.png'
+    output_path = Path(__file__).parent / 'docs' / 'sparse_attention_64k_complexity.png'
     output_path.parent.mkdir(exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white')
     print(f"✅ Chart saved to: {output_path}")
-    print(f"   (Referenced in README.md as docs/sparse_attention_64k_scaling.png)")
+    print(f"   (Referenced in README.md as docs/sparse_attention_64k_complexity.png)")
     print(f"   ⚠️  NOTE: This file is checked into git. Regenerating will overwrite it.")
 
     # Print key statistics

@@ -4,7 +4,7 @@
 
 ## Performance at a Glance: Production-Scale Sequences (64K+)
 
-![Sparse Attention 64K+ Scaling](docs/sparse_attention_64k_scaling.png)
+![Sparse Attention 64K+ Complexity](docs/sparse_attention_64k_complexity.png)
 
 **Performance at 64K Sequences (≈3-4 hours of tick data):**
 
