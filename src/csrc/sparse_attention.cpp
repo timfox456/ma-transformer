@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <random>
 #include <set>
+#include <map>
 
 namespace ma_core {
 
@@ -80,17 +81,20 @@ namespace ma_core {
         index_t batch_size = scores.shape().batch_size;
         index_t num_heads = scores.shape().num_heads;
         
+        // Pre-group sparse entries by row for efficiency
+        std::vector<std::vector<index_t>> row_to_cols(seq_len);
+        for (size_t idx = 0; idx < pattern.values.size(); ++idx) {
+            index_t i = pattern.row_indices[idx];
+            if (i < seq_len) {
+                row_to_cols[i].push_back(pattern.col_indices[idx]);
+            }
+        }
+
         // Apply softmax row-wise, but only consider non-masked positions
         for (index_t b = 0; b < batch_size; ++b) {
             for (index_t h = 0; h < num_heads; ++h) {
                 for (index_t i = 0; i < seq_len; ++i) {
-                    // Find all valid positions for this row in the sparse pattern
-                    std::vector<index_t> valid_positions;
-                    for (size_t idx = 0; idx < pattern.values.size(); ++idx) {
-                        if (pattern.row_indices[idx] == i) {
-                            valid_positions.push_back(pattern.col_indices[idx]);
-                        }
-                    }
+                    const auto& valid_positions = row_to_cols[i];
                     
                     if (valid_positions.empty()) continue;
                     
@@ -151,7 +155,7 @@ namespace ma_core {
         return output;
     }
 
-    SparseTensor SparseAttention::get_attention_pattern(const TensorShape& shape) {
+    SparseTensor SparseAttention::get_attention_pattern(const TensorShape& shape) const {
         return generate_sparse_pattern(shape);
     }
 
@@ -178,7 +182,7 @@ namespace ma_core {
     }
 
     // Sliding Window Attention
-    SparseTensor SlidingWindowAttention::generate_sparse_pattern(const TensorShape& shape) {
+    SparseTensor SlidingWindowAttention::generate_sparse_pattern(const TensorShape& shape) const {
         SparseTensor pattern(shape, device_);
         index_t seq_len = shape.sequence_length;
         index_t window_size = config_.window_size;
@@ -188,7 +192,7 @@ namespace ma_core {
         pattern.reserve(estimated_nnz);
         
         for (index_t i = 0; i < seq_len; ++i) {
-            index_t start = std::max(0L, i - window_size);
+            index_t start = std::max(static_cast<index_t>(0), i - window_size);
             index_t end = std::min(seq_len, i + window_size + 1);
             
             for (index_t j = start; j < end; ++j) {
@@ -200,7 +204,7 @@ namespace ma_core {
     }
 
     // Block Sparse Attention
-    SparseTensor BlockSparseAttention::generate_sparse_pattern(const TensorShape& shape) {
+    SparseTensor BlockSparseAttention::generate_sparse_pattern(const TensorShape& shape) const {
         SparseTensor pattern(shape, device_);
         index_t seq_len = shape.sequence_length;
         index_t block_size = config_.block_size;
@@ -212,7 +216,7 @@ namespace ma_core {
         for (index_t block_i = 0; block_i < num_blocks; ++block_i) {
             for (index_t block_j = 0; block_j < num_blocks; ++block_j) {
                 // Allow attention within the same block and adjacent blocks
-                if (std::abs(static_cast<int64_t>(block_i - block_j)) <= 1) {
+                if (std::abs(static_cast<int64_t>(block_i) - static_cast<int64_t>(block_j)) <= 1) {
                     index_t start_i = block_i * block_size;
                     index_t end_i = std::min((block_i + 1) * block_size, seq_len);
                     index_t start_j = block_j * block_size;
@@ -231,7 +235,7 @@ namespace ma_core {
     }
 
     // Longformer Attention (global + local)
-    SparseTensor LongformerAttention::generate_sparse_pattern(const TensorShape& shape) {
+    SparseTensor LongformerAttention::generate_sparse_pattern(const TensorShape& shape) const {
         SparseTensor pattern(shape, device_);
         index_t seq_len = shape.sequence_length;
         index_t window_size = config_.window_size;
@@ -239,7 +243,7 @@ namespace ma_core {
         
         // Add sliding window attention
         for (index_t i = 0; i < seq_len; ++i) {
-            index_t start = std::max(0L, i - window_size);
+            index_t start = std::max(static_cast<index_t>(0), i - window_size);
             index_t end = std::min(seq_len, i + window_size + 1);
             
             for (index_t j = start; j < end; ++j) {
@@ -255,6 +259,39 @@ namespace ma_core {
             }
         }
         
+        return pattern;
+    }
+
+    // Financial Attention
+    SparseTensor FinancialAttention::generate_sparse_pattern(const TensorShape& shape) const {
+        SparseTensor pattern(shape, device_);
+        index_t seq_len = shape.sequence_length;
+
+        // Local causal window
+        index_t local_window = config_.local_window_size;
+        for (index_t i = 0; i < seq_len; ++i) {
+            index_t start_local = (i >= local_window) ? (i - local_window + 1) : static_cast<index_t>(0);
+            for (index_t j = start_local; j <= i; ++j) {
+                pattern.add_entry(i, j, 1.0f);
+            }
+        }
+
+        // Dilated clusters
+        index_t stride = config_.dilation_stride;
+        index_t cluster_size = config_.dilation_cluster_size;
+        index_t num_clusters = config_.dilation_num_clusters;
+        for (index_t i = 0; i < seq_len; ++i) {
+            for (index_t k = 1; k <= num_clusters; ++k) {
+                int64_t cluster_end = static_cast<index_t>(i) - static_cast<int64_t>(k) * static_cast<int64_t>(stride);
+                int64_t cluster_start = cluster_end - static_cast<int64_t>(cluster_size) + 1;
+                if (cluster_end < 0) break; 
+                if (cluster_start < 0) cluster_start = 0;
+                for (int64_t j = cluster_start; j <= cluster_end; ++j) {
+                    pattern.add_entry(i, static_cast<index_t>(j), 1.0f);
+                }
+            }
+        }
+
         return pattern;
     }
 

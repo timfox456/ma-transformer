@@ -39,6 +39,34 @@ PYBIND11_MODULE(ma_core, m) {
           "Compute sparse attention with sliding window",
           py::arg("query"), py::arg("key"), py::arg("value"), py::arg("window_size") = 64);
     
+    m.def("compute_attention", &ma_core::compute_attention,
+          "Compute attention using unified config and factory",
+          py::arg("query"), py::arg("key"), py::arg("value"), py::arg("config"));
+    
+    // Enums
+    py::enum_<ma_core::AttentionPattern>(m, "AttentionPattern")
+        .value("FULL", ma_core::AttentionPattern::FULL)
+        .value("CAUSAL", ma_core::AttentionPattern::CAUSAL)
+        .value("SLIDING_WINDOW", ma_core::AttentionPattern::SLIDING_WINDOW)
+        .value("BLOCK_SPARSE", ma_core::AttentionPattern::BLOCK_SPARSE)
+        .value("LONGFORMER", ma_core::AttentionPattern::LONGFORMER)
+        .value("FINANCIAL", ma_core::AttentionPattern::FINANCIAL)
+        .value("BIG_BIRD", ma_core::AttentionPattern::BIG_BIRD)
+        .export_values();
+
+    // AttentionConfig struct
+    py::class_<ma_core::AttentionConfig>(m, "AttentionConfig")
+        .def(py::init<ma_core::AttentionPattern>(), py::arg("pattern") = ma_core::AttentionPattern::FULL)
+        .def_readwrite("pattern", &ma_core::AttentionConfig::pattern)
+        .def_readwrite("window_size", &ma_core::AttentionConfig::window_size)
+        .def_readwrite("block_size", &ma_core::AttentionConfig::block_size)
+        .def_readwrite("num_global_tokens", &ma_core::AttentionConfig::num_global_tokens)
+        .def_readwrite("use_causal_mask", &ma_core::AttentionConfig::use_causal_mask)
+        .def_readwrite("local_window_size", &ma_core::AttentionConfig::local_window_size)
+        .def_readwrite("dilation_stride", &ma_core::AttentionConfig::dilation_stride)
+        .def_readwrite("dilation_cluster_size", &ma_core::AttentionConfig::dilation_cluster_size)
+        .def_readwrite("dilation_num_clusters", &ma_core::AttentionConfig::dilation_num_clusters);
+
     // SparseTensor class
     py::class_<ma_core::SparseTensor>(m, "SparseTensor")
         .def_readonly("shape", &ma_core::SparseTensor::shape)

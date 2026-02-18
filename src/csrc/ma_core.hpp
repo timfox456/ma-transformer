@@ -31,5 +31,11 @@ namespace ma_core {
     
     Tensor compute_sparse_attention(const Tensor& query, const Tensor& key, const Tensor& value,
                                    int64_t window_size = 64);
+
+    /**
+     * Unified attention entry point using the factory and configuration
+     */
+    Tensor compute_attention(const Tensor& query, const Tensor& key, const Tensor& value,
+                            const AttentionConfig& config);
     
 } // namespace ma_core

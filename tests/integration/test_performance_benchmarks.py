@@ -435,4 +435,4 @@ class TestConcurrencyAndStability:
         print(f"  Increase: {memory_increase:.1f} MB")
         
         # Should not have significant memory increase
-    assert memory_increase < 100, f"Potential memory leak detected: +{memory_increase:.1f} MB"
+        assert memory_increase < 100, f"Potential memory leak detected: +{memory_increase:.1f} MB"

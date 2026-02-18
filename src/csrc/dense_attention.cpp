@@ -81,7 +81,11 @@ namespace ma_core {
         return masked_scores;
     }
 
-    SparseTensor DenseAttention::get_attention_pattern(const TensorShape& shape) {
+    SparseTensor DenseAttention::get_attention_pattern(const TensorShape& shape) const {
+        return generate_sparse_pattern(shape);
+    }
+
+    SparseTensor DenseAttention::generate_sparse_pattern(const TensorShape& shape) const {
         SparseTensor pattern(shape, device_);
         
         index_t seq_len = shape.sequence_length;

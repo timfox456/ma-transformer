@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ma_core.hpp"
+#include "attention_interface.hpp"
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -243,6 +244,12 @@ namespace ma_core {
         }
         
         return output;
+    }
+
+    Tensor compute_attention(const Tensor& query, const Tensor& key, const Tensor& value,
+                            const AttentionConfig& config) {
+        auto attention = create_attention(config, query.device());
+        return attention->forward(query, key, value);
     }
     
 } // namespace ma_core

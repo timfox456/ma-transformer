@@ -4,7 +4,7 @@ CXXFLAGS = -std=c++17 -O2 -Wall -Wextra
 INCLUDES = -I../../src/csrc -I/opt/homebrew/include
 LIBS = -L/opt/homebrew/lib -lgtest -lgtest_main -lpthread
 
-SOURCES = test_ma_core.cpp ../../src/csrc/ma_core.cpp
+SOURCES = test_ma_core.cpp ../../src/csrc/ma_core.cpp ../../src/csrc/tensor.cpp ../../src/csrc/dense_attention.cpp ../../src/csrc/sparse_attention.cpp ../../src/csrc/attention_factory.cpp
 TARGET = ma_core_tests
 
 .PHONY: all clean test

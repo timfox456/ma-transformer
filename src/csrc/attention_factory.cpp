@@ -2,6 +2,7 @@
 #include "attention_interface.hpp"
 #include <memory>
 #include <stdexcept>
+#include <algorithm>
 
 namespace ma_core {
 
@@ -21,6 +22,9 @@ namespace ma_core {
             case AttentionPattern::LONGFORMER:
                 return std::make_unique<LongformerAttention>(config.window_size, config.num_global_tokens, device);
             
+            case AttentionPattern::FINANCIAL:
+                return std::make_unique<FinancialAttention>(config, device);
+            
             // TODO: Implement additional sparse patterns
             case AttentionPattern::FIXED_PATTERN:
             case AttentionPattern::RANDOM_SPARSE:
@@ -30,52 +34,6 @@ namespace ma_core {
             default:
                 throw std::runtime_error("Unknown attention pattern");
         }
-    }
-
-    // Missing function implementations that we need
-    namespace {
-        // These are helper functions that were referenced but not implemented
-        
-        Tensor compute_sparse_attention_output(const Tensor& attention_weights, 
-                                             const Tensor& value, 
-                                             const SparseTensor& pattern) {
-            // This was referenced in sparse_attention.cpp but not found in the class
-            // Moving the implementation here as a standalone function
-            index_t batch_size = value.shape().batch_size;
-            index_t seq_len = value.shape().sequence_length;
-            index_t num_heads = value.shape().num_heads;
-            index_t head_dim = value.shape().head_dim;
-            
-            Tensor output(value.shape(), value.device(), value.layout());
-            output.zero();
-            
-            // Sparse matrix-vector multiplication
-            for (index_t b = 0; b < batch_size; ++b) {
-                for (index_t h = 0; h < num_heads; ++h) {
-                    for (size_t idx = 0; idx < pattern.values.size(); ++idx) {
-                        index_t i = pattern.row_indices[idx];
-                        index_t j = pattern.col_indices[idx];
-                        
-                        if (i < seq_len && j < seq_len) {
-                            scalar_t weight = attention_weights.at(b, i, h, j);
-                            for (index_t d = 0; d < head_dim; ++d) {
-                                output.at(b, i, h, d) += weight * value.at(b, j, h, d);
-                            }
-                        }
-                    }
-                }
-            }
-            
-            return output;
-        }
-    }
-
-    // Add the missing method to SparseAttention class by providing it as a standalone function
-    // that can be called from the class method
-    Tensor SparseAttention::compute_sparse_attention_output(const Tensor& attention_weights, 
-                                                           const Tensor& value, 
-                                                           const SparseTensor& pattern) {
-        return ::ma_core::compute_sparse_attention_output(attention_weights, value, pattern);
     }
 
     // Device-specific factory functions for future use
@@ -104,10 +62,10 @@ namespace ma_core {
         
         void print_attention_pattern(const SparseTensor& pattern) {
             printf("Sparse Attention Pattern:\n");
-            printf("Shape: [%ld, %ld, %ld, %ld]\n", 
+            printf("Shape: [%lld, %lld, %lld, %lld]\n", 
                    pattern.shape.batch_size, pattern.shape.sequence_length,
                    pattern.shape.num_heads, pattern.shape.head_dim);
-            printf("Non-zero elements: %ld\n", pattern.nnz());
+            printf("Non-zero elements: %lld\n", pattern.nnz());
             printf("Sparsity: %.2f%%\n", 
                    100.0 * (1.0 - static_cast<double>(pattern.nnz()) / 
                    (pattern.shape.sequence_length * pattern.shape.sequence_length)));
@@ -116,7 +74,7 @@ namespace ma_core {
             printf("First 10 entries:\n");
             size_t print_count = std::min(static_cast<size_t>(10), pattern.values.size());
             for (size_t i = 0; i < print_count; ++i) {
-                printf("  [%ld, %ld] = %.3f\n", 
+                printf("  [%lld, %lld] = %.3f\n", 
                        pattern.row_indices[i], pattern.col_indices[i], pattern.values[i]);
             }
         }

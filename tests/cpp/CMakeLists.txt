@@ -14,6 +14,10 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../../src/csrc)
 # Add source files
 set(CORE_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/csrc/ma_core.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/csrc/tensor.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/csrc/dense_attention.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/csrc/sparse_attention.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/csrc/attention_factory.cpp
 )
 
 # Create test executable

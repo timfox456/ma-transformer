@@ -48,7 +48,10 @@ ext_modules = [
         sources=[
             'src/csrc/main.cpp', 
             'src/csrc/ma_core.cpp',
-            'src/csrc/tensor.cpp'
+            'src/csrc/tensor.cpp',
+            'src/csrc/dense_attention.cpp',
+            'src/csrc/sparse_attention.cpp',
+            'src/csrc/attention_factory.cpp'
         ],
         include_dirs=[pybind11.get_include(), 'src/csrc'],
         language='c++',

@@ -5,13 +5,43 @@
 
 ---
 
-## 1. Abstract
+## Abstract
 
 The Transformer architecture, underpinned by the self-attention mechanism, has become the de facto standard for a wide range of sequence processing tasks. However, the standard "dense" attention mechanism has a computational and memory complexity of $O(n^2)$ with respect to the sequence length $n$. This quadratic scaling makes processing long sequences computationally prohibitive. Sparse attention mechanisms have emerged as a powerful solution, approximating the dense attention matrix with a sparse one, thereby reducing the complexity to $O(n \log n)$ or even $O(n)$. This document explores the mathematical foundations of sparse attention, detailing its theoretical justification and the common sparsity patterns employed.
 
 ---
 
-## 2. Background: The Standard Attention Mechanism
+## 1. Introduction
+
+Since its introduction by Vaswani et al. (2017), the Transformer architecture has revolutionized sequence modeling across natural language processing, computer vision, and time series analysis. At its core lies the self-attention mechanism, which computes pairwise interactions between all positions in a sequence, enabling the model to capture long-range dependencies without the sequential bottleneck of recurrent architectures.
+
+However, this expressive power comes at a steep computational cost. The standard attention mechanism requires computing an $n \times n$ attention matrix for a sequence of length $n$, resulting in $O(n^2)$ time and space complexity. For modern applications requiring long context windows—such as document summarization (tens of thousands of tokens), genomic sequence analysis (millions of base pairs), or high-frequency financial tick data (thousands of events per second)—this quadratic scaling becomes a fundamental barrier.
+
+Consider a practical example from high-frequency trading: processing 64,000 ticks (roughly 3-4 hours of market data for a liquid instrument) with dense attention requires materializing a 64K × 64K attention matrix with over 4 billion elements. At 32-bit floating point precision, this alone consumes 16 GB of GPU memory before accounting for gradients, activations, or model parameters. Even with modern datacenter GPUs, this makes real-time inference impractical.
+
+**Sparse attention** addresses this challenge by exploiting a key observation: most attention weights are small and contribute negligibly to the output. By restricting each query to attend only to a carefully selected subset of keys, sparse attention reduces complexity to $O(n \cdot w)$ or $O(n \log n)$ while preserving much of the representational power of dense attention.
+
+This paper provides a rigorous mathematical treatment of sparse attention mechanisms. We formalize the theoretical foundations, analyze common sparsity patterns, and discuss their implications for different domains. While we focus on general principles, we pay particular attention to applications in financial time series, where temporal locality and streaming requirements align naturally with sparse attention architectures.
+
+---
+
+## 2. Related Work
+
+The limitations of quadratic-complexity attention have motivated extensive research into efficient alternatives. We review the most influential sparse attention mechanisms that form the foundation of modern long-context Transformers.
+
+**Sparse Transformer.** Child et al. (2019) introduced structured sparsity patterns for attention, demonstrating that carefully designed sparse connectivity could match dense attention performance on generative modeling tasks. Their work proposed factorized attention patterns including strided and fixed attention, reducing complexity from $O(n^2)$ to $O(n \sqrt{n})$.
+
+**Longformer.** Beltagy et al. (2020) combined local sliding window attention with task-specific global attention, enabling processing of documents up to 4,096 tokens. Their key insight was that most tokens benefit from local context while a small number of tokens (e.g., `[CLS]`) require global information aggregation. This hybrid pattern achieves $O(n \cdot w)$ complexity.
+
+**BigBird.** Zaheer et al. (2020) provided theoretical analysis showing that sparse attention with random, window, and global components can approximate full attention. They proved that such patterns are Turing complete and universal approximators for sequence-to-sequence functions, establishing theoretical foundations for sparse attention mechanisms.
+
+**Other Notable Work.** Additional innovations include Reformer's locality-sensitive hashing for approximate attention (Kitaev et al., 2020), Linformer's low-rank projections (Wang et al., 2020), and FlashAttention's IO-aware algorithm (Dao et al., 2022), which optimizes dense attention but whose techniques can also accelerate sparse attention implementations.
+
+Our presentation synthesizes these ideas, providing a unified mathematical framework for understanding sparse attention mechanisms and their domain-specific applications.
+
+---
+
+## 3. Background: The Standard Attention Mechanism
 
 To understand sparse attention, we must first formalize the standard (dense) attention mechanism. Given a sequence of $n$ input token embeddings, we project them into three matrices: Query ($Q$), Key ($K$), and Value ($V$), each of dimension $\mathbb{R}^{n \times d_k}$, where $d_k$ is the dimension of the keys and queries.
 

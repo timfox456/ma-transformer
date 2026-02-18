@@ -34,6 +34,7 @@ namespace ma_core {
         RANDOM_SPARSE,  // Random sparse pattern
         BLOCK_SPARSE,   // Block-wise sparse attention
         LONGFORMER,     // Longformer-style (global + local)
+        FINANCIAL,       // Financial sparse pattern (local sliding + dilated clusters)
         BIG_BIRD        // BigBird-style (global + random + sliding)
     };
 
@@ -53,6 +54,16 @@ namespace ma_core {
         // Constructor with defaults
         AttentionConfig(AttentionPattern p = AttentionPattern::FULL) 
             : pattern(p) {}
+
+        // Financial sparse pattern parameters
+        // Local window size for micro-volatility (e.g., 512 ticks)
+        index_t local_window_size = 512;
+        // Dilation stride for macro regime (e.g., 1000 ticks)
+        index_t dilation_stride = 1000;
+        // Cluster size for dilated groups (e.g., 8 ticks per cluster)
+        index_t dilation_cluster_size = 8;
+        // Number of dilated clusters to attend to
+        index_t dilation_num_clusters = 10;
     };
 
     /**

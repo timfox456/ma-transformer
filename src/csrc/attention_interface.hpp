@@ -22,7 +22,7 @@ namespace ma_core {
         virtual Tensor forward(const Tensor& query, const Tensor& key, 
                               const Tensor& value) = 0;
         
-        virtual SparseTensor get_attention_pattern(const TensorShape& shape) = 0;
+        virtual SparseTensor get_attention_pattern(const TensorShape& shape) const = 0;
         
         // Optional: backward pass for training (can be implemented later)
         virtual std::tuple<Tensor, Tensor, Tensor> backward(
@@ -40,6 +40,9 @@ namespace ma_core {
         // Utility functions
         virtual index_t memory_usage(const TensorShape& shape) const = 0;
         virtual bool supports_device(Device device) const = 0;
+
+        // Pattern generation (moved to public for utility access)
+        virtual SparseTensor generate_sparse_pattern(const TensorShape& shape) const = 0;
 
     protected:
         AttentionConfig config_;
@@ -61,9 +64,10 @@ namespace ma_core {
             : AttentionBase(config, device) {}
         
         Tensor forward(const Tensor& query, const Tensor& key, const Tensor& value) override;
-        SparseTensor get_attention_pattern(const TensorShape& shape) override;
+        SparseTensor get_attention_pattern(const TensorShape& shape) const override;
         index_t memory_usage(const TensorShape& shape) const override;
         bool supports_device(Device device) const override;
+        SparseTensor generate_sparse_pattern(const TensorShape& shape) const override;
 
     protected:
         virtual Tensor compute_attention_scores(const Tensor& query, const Tensor& key);
@@ -80,14 +84,13 @@ namespace ma_core {
             : AttentionBase(config, device) {}
         
         Tensor forward(const Tensor& query, const Tensor& key, const Tensor& value) override;
-        SparseTensor get_attention_pattern(const TensorShape& shape) override;
+        SparseTensor get_attention_pattern(const TensorShape& shape) const override;
         index_t memory_usage(const TensorShape& shape) const override;
         bool supports_device(Device device) const override;
 
     protected:
-        virtual SparseTensor generate_sparse_pattern(const TensorShape& shape) = 0;
         virtual Tensor compute_sparse_attention_scores(const Tensor& query, const Tensor& key,
-                                                      const SparseTensor& pattern);
+                                                       const SparseTensor& pattern);
         Tensor apply_sparse_softmax(const Tensor& scores, const SparseTensor& pattern);
         Tensor compute_sparse_attention_output(const Tensor& attention_weights, 
                                              const Tensor& value, 
@@ -104,8 +107,7 @@ namespace ma_core {
             config_.window_size = window_size;
         }
 
-    protected:
-        SparseTensor generate_sparse_pattern(const TensorShape& shape) override;
+        SparseTensor generate_sparse_pattern(const TensorShape& shape) const override;
     };
 
     class BlockSparseAttention : public SparseAttention {
@@ -115,8 +117,7 @@ namespace ma_core {
             config_.block_size = block_size;
         }
 
-    protected:
-        SparseTensor generate_sparse_pattern(const TensorShape& shape) override;
+        SparseTensor generate_sparse_pattern(const TensorShape& shape) const override;
     };
 
     class LongformerAttention : public SparseAttention {
@@ -127,8 +128,15 @@ namespace ma_core {
             config_.num_global_tokens = num_global_tokens;
         }
 
-    protected:
-        SparseTensor generate_sparse_pattern(const TensorShape& shape) override;
+        SparseTensor generate_sparse_pattern(const TensorShape& shape) const override;
+    };
+
+    class FinancialAttention : public SparseAttention {
+    public:
+        FinancialAttention(const AttentionConfig& config, Device device = Device::CPU)
+            : SparseAttention(config, device) {}
+
+        SparseTensor generate_sparse_pattern(const TensorShape& shape) const override;
     };
 
     /**
