@@ -41,10 +41,9 @@ namespace ma_core {
         virtual index_t memory_usage(const TensorShape& shape) const = 0;
         virtual bool supports_device(Device device) const = 0;
 
-        // Pattern generation (moved to public for utility access)
+    protected:
         virtual SparseTensor generate_sparse_pattern(const TensorShape& shape) const = 0;
 
-    protected:
         AttentionConfig config_;
         Device device_;
 
@@ -67,9 +66,9 @@ namespace ma_core {
         SparseTensor get_attention_pattern(const TensorShape& shape) const override;
         index_t memory_usage(const TensorShape& shape) const override;
         bool supports_device(Device device) const override;
-        SparseTensor generate_sparse_pattern(const TensorShape& shape) const override;
 
     protected:
+        SparseTensor generate_sparse_pattern(const TensorShape& shape) const override;
         virtual Tensor compute_attention_scores(const Tensor& query, const Tensor& key);
         virtual Tensor apply_attention_mask(const Tensor& attention_scores);
     };
@@ -107,6 +106,7 @@ namespace ma_core {
             config_.window_size = window_size;
         }
 
+    protected:
         SparseTensor generate_sparse_pattern(const TensorShape& shape) const override;
     };
 
@@ -117,6 +117,7 @@ namespace ma_core {
             config_.block_size = block_size;
         }
 
+    protected:
         SparseTensor generate_sparse_pattern(const TensorShape& shape) const override;
     };
 
@@ -128,6 +129,7 @@ namespace ma_core {
             config_.num_global_tokens = num_global_tokens;
         }
 
+    protected:
         SparseTensor generate_sparse_pattern(const TensorShape& shape) const override;
     };
 
@@ -136,6 +138,7 @@ namespace ma_core {
         FinancialAttention(const AttentionConfig& config, Device device = Device::CPU)
             : SparseAttention(config, device) {}
 
+    protected:
         SparseTensor generate_sparse_pattern(const TensorShape& shape) const override;
     };
 

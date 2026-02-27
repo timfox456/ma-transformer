@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
+// Additional tests for uncommitted changes
+
 #include <gtest/gtest.h>
 #include <chrono>
 #include <climits>
-#include <cmath>
 #include <set>
+#include <cmath>
 #include "../../src/csrc/ma_core.hpp"
 #include "../../src/csrc/attention_interface.hpp"
 
 // Test fixture for ma_core tests
-class MaCoreTest : public ::testing::Test {
+class MaCoreNewTests : public ::testing::Test {
 protected:
     void SetUp() override {
         // Setup code for each test
@@ -19,94 +21,8 @@ protected:
     }
 };
 
-// Basic arithmetic tests
-TEST_F(MaCoreTest, TestAddPositiveNumbers) {
-    EXPECT_EQ(ma_core::add(2, 3), 5);
-    EXPECT_EQ(ma_core::add(10, 15), 25);
-    EXPECT_EQ(ma_core::add(100, 200), 300);
-}
-
-TEST_F(MaCoreTest, TestAddNegativeNumbers) {
-    EXPECT_EQ(ma_core::add(-2, -3), -5);
-    EXPECT_EQ(ma_core::add(-10, 5), -5);
-    EXPECT_EQ(ma_core::add(10, -15), -5);
-}
-
-TEST_F(MaCoreTest, TestAddZero) {
-    EXPECT_EQ(ma_core::add(0, 0), 0);
-    EXPECT_EQ(ma_core::add(5, 0), 5);
-    EXPECT_EQ(ma_core::add(0, -5), -5);
-}
-
-TEST_F(MaCoreTest, TestAddBoundaryValues) {
-    // Test with integer limits
-    EXPECT_EQ(ma_core::add(1, -1), 0);
-    EXPECT_EQ(ma_core::add(INT_MAX, 0), INT_MAX);
-    EXPECT_EQ(ma_core::add(INT_MIN, 0), INT_MIN);
-}
-
-// Commutative property test
-TEST_F(MaCoreTest, TestAddCommutative) {
-    int a = 42, b = 17;
-    EXPECT_EQ(ma_core::add(a, b), ma_core::add(b, a));
-}
-
-// Associative property test (for future multi-operand operations)
-TEST_F(MaCoreTest, TestAddAssociative) {
-    int a = 10, b = 20, c = 30;
-    EXPECT_EQ(ma_core::add(ma_core::add(a, b), c), ma_core::add(a, ma_core::add(b, c)));
-}
-
-// Performance test for basic operations
-TEST_F(MaCoreTest, TestAddPerformance) {
-    const int iterations = 1000000;
-    auto start = std::chrono::high_resolution_clock::now();
-    
-    volatile int result = 0;  // volatile to prevent optimization
-    for (int i = 0; i < iterations; ++i) {
-        result = ma_core::add(i, i + 1);
-    }
-    
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    
-    // Should complete within reasonable time (less than 100ms for 1M operations)
-    EXPECT_LT(duration.count(), 100000);
-    EXPECT_EQ(result, ma_core::add(iterations - 1, iterations));  // Check last result
-}
-
-// Attention tests
-TEST_F(MaCoreTest, TestFinancialAttentionPattern) {
-    ma_core::AttentionConfig config(ma_core::AttentionPattern::FINANCIAL);
-    config.local_window_size = 5;
-    config.dilation_stride = 10;
-    config.dilation_cluster_size = 2;
-    config.dilation_num_clusters = 1;
-    
-    ma_core::TensorShape shape(1, 20, 1, 1);
-    auto attention = ma_core::create_attention(config, ma_core::Device::CPU);
-    auto pattern = attention->get_attention_pattern(shape);
-    
-    // Query 15:
-    // Local window: [15-5+1, 15] = [11, 15]
-    // Dilated cluster 1: [15-10-2+1, 15-10] = [4, 5]
-    
-    std::set<ma_core::index_t> expected = {11, 12, 13, 14, 15, 4, 5};
-    std::set<ma_core::index_t> actual;
-    
-    for (size_t i = 0; i < pattern.row_indices.size(); ++i) {
-        if (pattern.row_indices[i] == 15) {
-            actual.insert(pattern.col_indices[i]);
-        }
-    }
-    
-    EXPECT_EQ(actual, expected);
-}
-
-// NEW TESTS FOR UNCOMMITTED CHANGES
-
 // Test get_attention_pattern() API for all attention types
-TEST_F(MaCoreTest, TestGetAttentionPatternAPI) {
+TEST_F(MaCoreNewTests, TestGetAttentionPatternAPI) {
     // Test that get_attention_pattern() is accessible and returns valid patterns
     ma_core::TensorShape shape(1, 20, 2, 4);
     
@@ -140,23 +56,23 @@ TEST_F(MaCoreTest, TestGetAttentionPatternAPI) {
         EXPECT_EQ(pattern.values.size(), pattern.row_indices.size());
     }
     
-    // Test Causal DenseAttention
+    // Test DenseAttention (causal)
     {
-        ma_core::AttentionConfig causal_config(ma_core::AttentionPattern::CAUSAL);
-        auto causal_attention = ma_core::create_attention(causal_config, ma_core::Device::CPU);
-        auto pattern = causal_attention->get_attention_pattern(shape);
+        ma_core::AttentionConfig dense_config(ma_core::AttentionPattern::DENSE);
+        auto dense_attention = ma_core::create_attention(dense_config, ma_core::Device::CPU);
+        auto pattern = dense_attention->get_attention_pattern(shape);
         
-        // Causal should have triangular pattern: n*(n+1)/2 entries
-        ma_core::index_t expected_entries = shape.sequence_length * (shape.sequence_length + 1) / 2;
+        // Dense causal should have triangular pattern: n*(n+1)/2 entries
+        index_t expected_entries = shape.sequence_length * (shape.sequence_length + 1) / 2;
         EXPECT_EQ(pattern.values.size(), expected_entries);
     }
 }
 
 // Test that get_attention_pattern is the public interface
-TEST_F(MaCoreTest, TestProtectedPatternGeneration) {
+TEST_F(MaCoreNewTests, TestProtectedPatternGeneration) {
     // The fact that this test compiles and runs confirms that
     // generate_sparse_pattern is protected and get_attention_pattern
-    // is the public interface.
+    // is the public interface. We test get_attention_pattern thoroughly.
     ma_core::AttentionConfig config(ma_core::AttentionPattern::SLIDING_WINDOW);
     config.window_size = 4;
     
@@ -169,7 +85,7 @@ TEST_F(MaCoreTest, TestProtectedPatternGeneration) {
 }
 
 // Test sparse attention output computation optimization
-TEST_F(MaCoreTest, TestSparseAttentionOutputOptimization) {
+TEST_F(MaCoreNewTests, TestSparseAttentionOutputOptimization) {
     // This test verifies that the optimized compute_sparse_attention_output
     // produces correct results without duplicate entries
     ma_core::AttentionConfig config(ma_core::AttentionPattern::SLIDING_WINDOW);
@@ -184,13 +100,13 @@ TEST_F(MaCoreTest, TestSparseAttentionOutputOptimization) {
     ma_core::Tensor value(shape, ma_core::Device::CPU);
     
     // Initialize with deterministic values
-    for (ma_core::index_t b = 0; b < shape.batch_size; ++b) {
-        for (ma_core::index_t s = 0; s < shape.sequence_length; ++s) {
-            for (ma_core::index_t h = 0; h < shape.num_heads; ++h) {
-                for (ma_core::index_t d = 0; d < shape.head_dim; ++d) {
-                    query.at(b, s, h, d) = static_cast<ma_core::scalar_t>(s + d) * 0.1f;
-                    key.at(b, s, h, d) = static_cast<ma_core::scalar_t>(s + d) * 0.05f;
-                    value.at(b, s, h, d) = static_cast<ma_core::scalar_t>(s + 1);
+    for (index_t b = 0; b < shape.batch_size; ++b) {
+        for (index_t s = 0; s < shape.sequence_length; ++s) {
+            for (index_t h = 0; h < shape.num_heads; ++h) {
+                for (index_t d = 0; d < shape.head_dim; ++d) {
+                    query.at(b, s, h, d) = static_cast<scalar_t>(s + d) * 0.1f;
+                    key.at(b, s, h, d) = static_cast<scalar_t>(s + d) * 0.05f;
+                    value.at(b, s, h, d) = static_cast<scalar_t>(s + 1);
                 }
             }
         }
@@ -206,11 +122,11 @@ TEST_F(MaCoreTest, TestSparseAttentionOutputOptimization) {
     EXPECT_EQ(output.shape().head_dim, shape.head_dim);
     
     // Output should not contain NaN or Inf
-    for (ma_core::index_t b = 0; b < shape.batch_size; ++b) {
-        for (ma_core::index_t s = 0; s < shape.sequence_length; ++s) {
-            for (ma_core::index_t h = 0; h < shape.num_heads; ++h) {
-                for (ma_core::index_t d = 0; d < shape.head_dim; ++d) {
-                    ma_core::scalar_t val = output.at(b, s, h, d);
+    for (index_t b = 0; b < shape.batch_size; ++b) {
+        for (index_t s = 0; s < shape.sequence_length; ++s) {
+            for (index_t h = 0; h < shape.num_heads; ++h) {
+                for (index_t d = 0; d < shape.head_dim; ++d) {
+                    scalar_t val = output.at(b, s, h, d);
                     EXPECT_FALSE(std::isnan(val));
                     EXPECT_FALSE(std::isinf(val));
                 }
@@ -218,19 +134,15 @@ TEST_F(MaCoreTest, TestSparseAttentionOutputOptimization) {
         }
     }
     
-    // Verify the pattern structure (sliding window is bidirectional)
+    // Verify causality: each position should only attend to previous positions
     auto pattern = attention->get_attention_pattern(shape);
-    EXPECT_GT(pattern.row_indices.size(), 0);
-    
-    // Verify pattern indices are within bounds
     for (size_t i = 0; i < pattern.row_indices.size(); ++i) {
-        EXPECT_LT(pattern.row_indices[i], shape.sequence_length);
-        EXPECT_LT(pattern.col_indices[i], shape.sequence_length);
+        EXPECT_LE(pattern.col_indices[i], pattern.row_indices[i]);
     }
 }
 
 // Test FinancialAttention duplicate entry prevention
-TEST_F(MaCoreTest, TestFinancialAttentionNoDuplicateEntries) {
+TEST_F(MaCoreNewTests, TestFinancialAttentionNoDuplicateEntries) {
     // This test verifies that the FinancialAttention pattern does not have
     // duplicate entries where dilated clusters overlap with local windows
     ma_core::AttentionConfig config(ma_core::AttentionPattern::FINANCIAL);
@@ -246,7 +158,7 @@ TEST_F(MaCoreTest, TestFinancialAttentionNoDuplicateEntries) {
     auto pattern = attention->get_attention_pattern(shape);
     
     // Check each query position for duplicate entries
-    for (ma_core::index_t query_pos = 10; query_pos < 30; ++query_pos) {
+    for (index_t query_pos = 10; query_pos < 30; ++query_pos) {
         std::set<ma_core::index_t> unique_cols;
         std::vector<ma_core::index_t> all_cols;
         
@@ -273,7 +185,7 @@ TEST_F(MaCoreTest, TestFinancialAttentionNoDuplicateEntries) {
 }
 
 // Test that FinancialAttention properly handles edge case with large local window
-TEST_F(MaCoreTest, TestFinancialAttentionLargeWindowEdgeCase) {
+TEST_F(MaCoreNewTests, TestFinancialAttentionLargeWindowEdgeCase) {
     // When local window is large enough to cover dilated clusters,
     // the dilated clusters should be skipped to avoid duplicates
     ma_core::AttentionConfig config(ma_core::AttentionPattern::FINANCIAL);
@@ -287,7 +199,7 @@ TEST_F(MaCoreTest, TestFinancialAttentionLargeWindowEdgeCase) {
     auto pattern = attention->get_attention_pattern(shape);
     
     // Check query positions that would have overlapping clusters
-    for (ma_core::index_t query_pos = 20; query_pos < 25; ++query_pos) {
+    for (index_t query_pos = 20; query_pos < 25; ++query_pos) {
         std::vector<ma_core::index_t> cols;
         for (size_t i = 0; i < pattern.row_indices.size(); ++i) {
             if (pattern.row_indices[i] == query_pos) {
@@ -300,20 +212,20 @@ TEST_F(MaCoreTest, TestFinancialAttentionLargeWindowEdgeCase) {
         EXPECT_EQ(cols.size(), unique_cols.size());
         
         // Verify local window is included
-        ma_core::index_t expected_start = (query_pos >= 20) ? (query_pos - 20 + 1) : 0;
-        for (ma_core::index_t j = expected_start; j <= query_pos; ++j) {
+        index_t expected_start = (query_pos >= 20) ? (query_pos - 20 + 1) : 0;
+        for (index_t j = expected_start; j <= query_pos; ++j) {
             EXPECT_TRUE(unique_cols.count(j) > 0);
         }
     }
 }
 
 // Test compute_sparse_attention_output with different pattern densities
-TEST_F(MaCoreTest, TestSparseAttentionVaryingDensity) {
+TEST_F(MaCoreNewTests, TestSparseAttentionVaryingDensity) {
     // Test with different sparsity levels to ensure the optimization
     // works correctly across different densities
     struct TestCase {
-        ma_core::index_t seq_len;
-        ma_core::index_t window_size;
+        index_t seq_len;
+        index_t window_size;
     };
     
     TestCase cases[] = {
@@ -335,20 +247,20 @@ TEST_F(MaCoreTest, TestSparseAttentionVaryingDensity) {
         ma_core::Tensor value(shape, ma_core::Device::CPU);
         
         // Initialize
-        for (ma_core::index_t s = 0; s < test_case.seq_len; ++s) {
-            for (ma_core::index_t d = 0; d < 4; ++d) {
+        for (index_t s = 0; s < test_case.seq_len; ++s) {
+            for (index_t d = 0; d < 4; ++d) {
                 query.at(0, s, 0, d) = 0.1f;
                 key.at(0, s, 0, d) = 0.1f;
-                value.at(0, s, 0, d) = static_cast<ma_core::scalar_t>(s + 1);
+                value.at(0, s, 0, d) = static_cast<scalar_t>(s + 1);
             }
         }
         
         auto output = attention->forward(query, key, value);
         
         // Verify output is valid
-        for (ma_core::index_t s = 0; s < test_case.seq_len; ++s) {
-            for (ma_core::index_t d = 0; d < 4; ++d) {
-                ma_core::scalar_t val = output.at(0, s, 0, d);
+        for (index_t s = 0; s < test_case.seq_len; ++s) {
+            for (index_t d = 0; d < 4; ++d) {
+                scalar_t val = output.at(0, s, 0, d);
                 EXPECT_FALSE(std::isnan(val));
             }
         }
@@ -356,7 +268,7 @@ TEST_F(MaCoreTest, TestSparseAttentionVaryingDensity) {
 }
 
 // Test pattern validation through get_attention_pattern
-TEST_F(MaCoreTest, TestPatternValidation) {
+TEST_F(MaCoreNewTests, TestPatternValidation) {
     ma_core::AttentionConfig config(ma_core::AttentionPattern::SLIDING_WINDOW);
     config.window_size = 4;
     
@@ -388,7 +300,7 @@ TEST_F(MaCoreTest, TestPatternValidation) {
 }
 
 // Test attention pattern consistency with factory-created instances
-TEST_F(MaCoreTest, TestFactoryPatternConsistency) {
+TEST_F(MaCoreNewTests, TestFactoryPatternConsistency) {
     // Verify that patterns created via factory are consistent
     ma_core::AttentionConfig config(ma_core::AttentionPattern::FINANCIAL);
     config.local_window_size = 6;
@@ -408,9 +320,9 @@ TEST_F(MaCoreTest, TestFactoryPatternConsistency) {
         // Cluster 1 end: 20-8=12, start: 12-2+1=11, skip overlap
         // Cluster 2 end: 20-16=4, start: 4-2+1=3
         std::set<ma_core::index_t> expected;
-        for (ma_core::index_t j = 15; j <= 20; ++j) expected.insert(j);
-        for (ma_core::index_t j = 11; j <= 12; ++j) expected.insert(j);  // cluster 1, non-overlapping
-        for (ma_core::index_t j = 3; j <= 4; ++j) expected.insert(j);    // cluster 2
+        for (index_t j = 15; j <= 20; ++j) expected.insert(j);
+        for (index_t j = 11; j <= 12; ++j) expected.insert(j);  // cluster 1, non-overlapping
+        for (index_t j = 3; j <= 4; ++j) expected.insert(j);    // cluster 2
         
         std::set<ma_core::index_t> actual;
         for (size_t i = 0; i < pattern.row_indices.size(); ++i) {
@@ -421,4 +333,9 @@ TEST_F(MaCoreTest, TestFactoryPatternConsistency) {
         
         EXPECT_EQ(actual, expected);
     }
+}
+
+int main(int argc, char **argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
 }

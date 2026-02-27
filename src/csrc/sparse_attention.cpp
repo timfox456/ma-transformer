@@ -123,26 +123,31 @@ namespace ma_core {
         return result;
     }
 
-    Tensor SparseAttention::compute_sparse_attention_output(const Tensor& attention_weights, 
-                                                           const Tensor& value, 
+    Tensor SparseAttention::compute_sparse_attention_output(const Tensor& attention_weights,
+                                                           const Tensor& value,
                                                            const SparseTensor& pattern) {
-        // Compute output = attention_weights @ value, but only for sparse positions
         index_t batch_size = value.shape().batch_size;
         index_t seq_len = value.shape().sequence_length;
         index_t num_heads = value.shape().num_heads;
         index_t head_dim = value.shape().head_dim;
-        
+
         Tensor output(value.shape(), value.device(), value.layout());
         output.zero();
-        
-        // Sparse matrix-vector multiplication
+
+        // Pre-group pattern entries by row (pattern is independent of batch/head)
+        std::vector<std::vector<index_t>> row_to_cols(seq_len);
+        for (size_t idx = 0; idx < pattern.values.size(); ++idx) {
+            index_t i = pattern.row_indices[idx];
+            if (i < seq_len) {
+                row_to_cols[i].push_back(pattern.col_indices[idx]);
+            }
+        }
+
+        // Sparse output = attention_weights @ value
         for (index_t b = 0; b < batch_size; ++b) {
             for (index_t h = 0; h < num_heads; ++h) {
-                for (size_t idx = 0; idx < pattern.values.size(); ++idx) {
-                    index_t i = pattern.row_indices[idx];
-                    index_t j = pattern.col_indices[idx];
-                    
-                    if (i < seq_len && j < seq_len) {
+                for (index_t i = 0; i < seq_len; ++i) {
+                    for (index_t j : row_to_cols[i]) {
                         scalar_t weight = attention_weights.at(b, i, h, j);
                         for (index_t d = 0; d < head_dim; ++d) {
                             output.at(b, i, h, d) += weight * value.at(b, j, h, d);
@@ -151,7 +156,7 @@ namespace ma_core {
                 }
             }
         }
-        
+
         return output;
     }
 
@@ -267,26 +272,27 @@ namespace ma_core {
         SparseTensor pattern(shape, device_);
         index_t seq_len = shape.sequence_length;
 
-        // Local causal window
         index_t local_window = config_.local_window_size;
+        index_t stride = config_.dilation_stride;
+        index_t cluster_size = config_.dilation_cluster_size;
+        index_t num_clusters = config_.dilation_num_clusters;
+
         for (index_t i = 0; i < seq_len; ++i) {
+            // Local causal window: [start_local, i]
             index_t start_local = (i >= local_window) ? (i - local_window + 1) : static_cast<index_t>(0);
             for (index_t j = start_local; j <= i; ++j) {
                 pattern.add_entry(i, j, 1.0f);
             }
-        }
 
-        // Dilated clusters
-        index_t stride = config_.dilation_stride;
-        index_t cluster_size = config_.dilation_cluster_size;
-        index_t num_clusters = config_.dilation_num_clusters;
-        for (index_t i = 0; i < seq_len; ++i) {
+            // Dilated clusters — skip any position already covered by the local window
+            // to prevent duplicate entries that would corrupt softmax normalization.
             for (index_t k = 1; k <= num_clusters; ++k) {
-                int64_t cluster_end = static_cast<index_t>(i) - static_cast<int64_t>(k) * static_cast<int64_t>(stride);
+                int64_t cluster_end = static_cast<int64_t>(i) - static_cast<int64_t>(k) * static_cast<int64_t>(stride);
                 int64_t cluster_start = cluster_end - static_cast<int64_t>(cluster_size) + 1;
-                if (cluster_end < 0) break; 
+                if (cluster_end < 0) break;
                 if (cluster_start < 0) cluster_start = 0;
                 for (int64_t j = cluster_start; j <= cluster_end; ++j) {
+                    if (static_cast<index_t>(j) >= start_local) continue; // already in local window
                     pattern.add_entry(i, static_cast<index_t>(j), 1.0f);
                 }
             }
@@ -313,12 +319,12 @@ namespace ma_core {
 
         SparseTensor create_sliding_window_pattern(const TensorShape& shape, index_t window_size) {
             SlidingWindowAttention attention(window_size);
-            return attention.generate_sparse_pattern(shape);
+            return attention.get_attention_pattern(shape);
         }
 
         SparseTensor create_block_sparse_pattern(const TensorShape& shape, index_t block_size) {
             BlockSparseAttention attention(block_size);
-            return attention.generate_sparse_pattern(shape);
+            return attention.get_attention_pattern(shape);
         }
 
         SparseTensor create_random_sparse_pattern(const TensorShape& shape, scalar_t sparsity_ratio) {
