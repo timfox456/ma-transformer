@@ -196,7 +196,7 @@ def generate_64k_theoretical_chart(include_timing_panel=False):
 
     # Annotations
     idx_64k = np.where(seq_lengths == 65536)[0][0]
-    ax_mem.annotate('64K Sparse: 0.26GB\nvs\nDense: 68GB',
+    ax_mem.annotate(f'64K Sparse: {sparse_memory[idx_64k]:.2f}GB\nvs\nDense: {dense_memory[idx_64k]:.1f}GB',
                    xy=(65536, sparse_memory[idx_64k]), xytext=(20000, 5),
                    fontsize=11, weight='bold',
                    bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.9),
@@ -261,9 +261,11 @@ def generate_64k_theoretical_chart(include_timing_panel=False):
             'Sparse attention enables full session microstructure modeling within HFT latency constraints.'
         )
     else:
+        idx_64k = np.where(seq_lengths == 65536)[0][0]
         footer_text = (
             'Market Context: 64K ticks ≈ 3-4 hours of active trading. '
-            'Sparse O(n·w): <1GB memory, 1,000x less compute vs Dense O(n²): 68GB (impractical). '
+            f'Sparse O(n·w): <1GB memory, 1,000x less compute vs Dense O(n²) with materialized scores: '
+            f'{dense_memory[idx_64k]:.0f}GB (impractical). '
             'Latency benchmarks available after CUDA GPU testing.'
         )
     fig.text(0.5, 0.02, footer_text, ha='center', fontsize=10, style='italic',
@@ -305,8 +307,9 @@ def main():
     window = 64
 
     # Memory
-    sparse_mem = (1 * 4 * seq_64k * window * 4 + 3 * seq_64k * 4 * 64 * 4) / (1024**3)
-    dense_mem = (1 * 4 * seq_64k * seq_64k * 4 + 3 * seq_64k * 4 * 64 * 4) / (1024**3)
+    # Same model as calc_*_memory_gb: attention scores + Q/K/V + output
+    sparse_mem = (1 * 4 * seq_64k * window * 4 + 4 * seq_64k * 4 * 64 * 4) / (1024**3)
+    dense_mem = (1 * 4 * seq_64k * seq_64k * 4 + 4 * seq_64k * 4 * 64 * 4) / (1024**3)
 
     print(f"💾 Memory:")
     print(f"   Sparse: {sparse_mem:.2f} GB")

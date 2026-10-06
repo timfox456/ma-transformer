@@ -10,12 +10,14 @@
 
 | Metric | Dense Attention O(n²) | Sparse Attention O(n·w) | Advantage |
 |--------|----------------------|-------------------------|-----------|
-| **Memory** | 64.2 GB | 0.25 GB | **99.6% reduction** |
+| **Memory** | 64.2 GB* | 0.31 GB | **99.5% reduction** |
 | **Computation** | 4,398 GFLOPs | 4.3 GFLOPs | **1,000x less compute** |
 | **Feasibility** | ❌ Impractical (OOM on 16GB GPU) | ✅ Runs on consumer hardware |
 | **Latency** | TBD (CUDA benchmarks) | TBD (CUDA benchmarks) | **Subquadratic scaling** |
 
-**Key Insight:** Dense attention's O(n²) complexity becomes **completely impractical** for production HFT sequences. At 64K ticks (a typical morning session), dense attention requires 64GB memory—making real-time inference impossible. Sparse attention's O(n·w) complexity enables the same inference with <1GB memory and 1,000x less computation.
+\*Theoretical, fp32, batch 1, 4 heads, head dim 64, window 64: attention scores plus Q/K/V and output. Dense assumes the full score matrix is materialized (16 GB per head). See `generate_theoretical_64k_chart.py`.
+
+**Key Insight:** Dense attention's O(n²) complexity becomes **completely impractical** for production HFT sequences. At 64K ticks (a typical morning session), a naive dense implementation needs 64GB just for its attention scores. IO-aware kernels like FlashAttention avoid storing those scores, but they still perform all ~4.4 trillion operations per layer, which rules out real-time inference. Sparse attention's O(n·w) complexity enables the same inference with <1GB memory and 1,000x less computation.
 
 > **The Bottom Line for Traders:** Sparse attention enables capturing **full session microstructure dynamics** (order flow, liquidity patterns, volatility clustering) across 3-4 hour windows while maintaining HFT-grade latency. Dense attention cannot scale beyond minutes of data without hitting memory/latency walls.
 
