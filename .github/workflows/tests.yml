@@ -23,8 +23,10 @@ jobs:
         run: pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Install package and test dependencies
         run: pip install -e . psutil
+      # Wall-clock benchmark assertions are excluded: shared CI runners are too
+      # noisy for them. Run them locally with plain `pytest`.
       - name: Run tests
-        run: python -m pytest tests/python tests/integration
+        run: python -m pytest tests/python tests/integration -m "not benchmark"
 
   cpp:
     name: C++ (GoogleTest)
