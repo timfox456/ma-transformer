@@ -1,0 +1,247 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Numerical parity tests for every attention backend.
+
+Each sparsity pattern is defined here independently, as an explicit set of
+allowed (query, key) pairs, and attention is computed densely in float64.
+Every backend (ma_core C++ entry points, the vectorized PyTorch path on CPU and
+MPS, and the PyTorch bridge) must match that reference on random inputs,
+including shapes with several heads and sequence lengths that do not divide
+evenly into blocks.
+"""
+
+import os
+import sys
+
+import pytest
+import torch
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
+
+from layers.blocked_attention import financial_attention, sliding_window_attention  # noqa: E402
+
+try:
+    import ma_core
+    from layers.ma_core_bridge import MACoreAttention, ma_core_to_pytorch, pytorch_to_ma_core
+    from layers.sparse_attention import SparseAttention
+    HAS_MA_CORE = True
+except ImportError:
+    HAS_MA_CORE = False
+
+needs_ma_core = pytest.mark.skipif(not HAS_MA_CORE, reason="ma_core extension not built")
+
+DEVICES = ["cpu"] + (["mps"] if torch.backends.mps.is_available() else []) \
+    + (["cuda"] if torch.cuda.is_available() else [])
+
+SHAPES = [(1, 17, 1, 8), (2, 64, 3, 16), (2, 300, 2, 32)]
+
+# Small financial parameters so clusters overlap the local window
+FIN_SMALL = dict(local_window_size=8, dilation_stride=5, dilation_cluster_size=3, dilation_num_clusters=3)
+
+
+# --- Reference patterns, written as plain sets of (query, key) pairs ---------
+
+def window_pairs(S, w, causal=False):
+    return {(i, j) for i in range(S) for j in range(S) if abs(i - j) <= w and (not causal or j <= i)}
+
+
+def block_sparse_pairs(S, b):
+    return {(i, j) for i in range(S) for j in range(S) if abs(i // b - j // b) <= 1}
+
+
+def longformer_pairs(S, w, g):
+    return {(i, j) for i in range(S) for j in range(S) if i < g or j < g or abs(i - j) <= w}
+
+
+def financial_pairs(S, local_window_size, dilation_stride, dilation_cluster_size, dilation_num_clusters):
+    pairs = set()
+    for i in range(S):
+        pairs.update((i, j) for j in range(max(0, i - local_window_size + 1), i + 1))
+        for c in range(1, dilation_num_clusters + 1):
+            end = i - c * dilation_stride
+            pairs.update((i, j) for j in range(max(0, end - dilation_cluster_size + 1), end + 1))
+    return pairs
+
+
+def full_pairs(S, causal=False):
+    return {(i, j) for i in range(S) for j in range(S) if not causal or j <= i}
+
+
+def reference_attention(q, k, v, pairs):
+    """Dense masked attention in float64. q, k, v are [batch, seq, heads, dim]."""
+    S = q.shape[1]
+    mask = torch.zeros(S, S, dtype=torch.bool)
+    for i, j in pairs:
+        mask[i, j] = True
+    q, k, v = (t.cpu().double() for t in (q, k, v))
+    scores = torch.einsum("bihd,bjhd->bhij", q, k) / q.shape[-1] ** 0.5
+    weights = scores.masked_fill(~mask, float("-inf")).softmax(-1)
+    return torch.einsum("bhij,bjhd->bihd", weights, v)
+
+
+def random_qkv(shape, dtype=torch.float32, device="cpu", seed=0):
+    gen = torch.Generator().manual_seed(seed)
+    return [torch.randn(shape, generator=gen, dtype=dtype).to(device) for _ in range(3)]
+
+
+def assert_close(actual, expected, atol=2e-5):
+    actual = actual.detach().cpu().double()
+    err = (actual - expected).abs().max().item()
+    assert err <= atol, f"max abs error {err:.3g} exceeds {atol:.0e}"
+
+
+# --- ma_core C++ engine --------------------------------------------------------
+
+def run_ma_core(q, k, v, config):
+    out = ma_core.compute_attention(pytorch_to_ma_core(q), pytorch_to_ma_core(k), pytorch_to_ma_core(v), config)
+    return ma_core_to_pytorch(out, q.device, q.dtype)
+
+
+def make_config(pattern, **fields):
+    config = ma_core.AttentionConfig(getattr(ma_core.AttentionPattern, pattern))
+    for name, value in fields.items():
+        setattr(config, name, value)
+    return config
+
+
+@needs_ma_core
+@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("pattern, fields, pairs_fn", [
+    ("FULL", {}, lambda S: full_pairs(S)),
+    ("CAUSAL", {}, lambda S: full_pairs(S, causal=True)),
+    ("SLIDING_WINDOW", {"window_size": 5}, lambda S: window_pairs(S, 5)),
+    ("BLOCK_SPARSE", {"block_size": 16}, lambda S: block_sparse_pairs(S, 16)),
+    ("LONGFORMER", {"window_size": 3, "num_global_tokens": 2}, lambda S: longformer_pairs(S, 3, 2)),
+    ("FINANCIAL", FIN_SMALL, lambda S: financial_pairs(S, **FIN_SMALL)),
+])
+def test_compute_attention_matches_reference(shape, pattern, fields, pairs_fn):
+    q, k, v = random_qkv(shape)
+    out = run_ma_core(q, k, v, make_config(pattern, **fields))
+    assert_close(out, reference_attention(q, k, v, pairs_fn(shape[1])))
+
+
+@needs_ma_core
+@pytest.mark.parametrize("seq_len", [1024, 2048])
+def test_financial_default_config_long_sequence(seq_len):
+    """Regression: these lengths used to crash the process with an out-of-bounds write."""
+    shape = (1, seq_len, 2, 16)
+    q, k, v = random_qkv(shape)
+    out = run_ma_core(q, k, v, make_config("FINANCIAL"))
+    defaults = dict(local_window_size=512, dilation_stride=1000, dilation_cluster_size=8, dilation_num_clusters=10)
+    assert_close(out, reference_attention(q, k, v, financial_pairs(seq_len, **defaults)))
+
+
+@needs_ma_core
+@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("causal", [False, True])
+def test_compute_dense_attention_matches_reference(shape, causal):
+    q, k, v = random_qkv(shape)
+    mq, mk, mv = map(pytorch_to_ma_core, (q, k, v))
+    out = ma_core_to_pytorch(ma_core.compute_dense_attention(mq, mk, mv, causal), q.device, q.dtype)
+    assert_close(out, reference_attention(q, k, v, full_pairs(shape[1], causal)))
+
+
+@needs_ma_core
+@pytest.mark.parametrize("shape", SHAPES)
+def test_compute_sparse_attention_matches_reference(shape):
+    q, k, v = random_qkv(shape)
+    mq, mk, mv = map(pytorch_to_ma_core, (q, k, v))
+    out = ma_core_to_pytorch(ma_core.compute_sparse_attention(mq, mk, mv, 4), q.device, q.dtype)
+    assert_close(out, reference_attention(q, k, v, window_pairs(shape[1], 4)))
+
+
+# --- Vectorized PyTorch path ----------------------------------------------------
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("block_size", [1, 7, 64, 256])
+@pytest.mark.parametrize("causal", [False, True])
+def test_sliding_window_attention_matches_reference(device, shape, block_size, causal):
+    q, k, v = random_qkv(shape, device=device)
+    out = sliding_window_attention(q, k, v, 5, causal=causal, block_size=block_size)
+    assert out.device.type == device
+    assert_close(out, reference_attention(q, k, v, window_pairs(shape[1], 5, causal)), atol=1e-4)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("block_size", [1, 7, 64])
+def test_financial_attention_matches_reference(device, shape, block_size):
+    q, k, v = random_qkv(shape, device=device)
+    out = financial_attention(q, k, v, block_size=block_size, **FIN_SMALL)
+    assert_close(out, reference_attention(q, k, v, financial_pairs(shape[1], **FIN_SMALL)), atol=1e-4)
+
+
+@pytest.mark.parametrize("fn, pairs_fn", [
+    (lambda q, k, v: sliding_window_attention(q, k, v, 3, block_size=5), lambda S: window_pairs(S, 3)),
+    (lambda q, k, v: sliding_window_attention(q, k, v, 3, causal=True, block_size=5),
+     lambda S: window_pairs(S, 3, causal=True)),
+    (lambda q, k, v: financial_attention(q, k, v, block_size=5, **FIN_SMALL),
+     lambda S: financial_pairs(S, **FIN_SMALL)),
+])
+def test_vectorized_gradients_match_reference(fn, pairs_fn):
+    shape = (2, 23, 2, 8)
+    q, k, v = (t.requires_grad_() for t in random_qkv(shape, dtype=torch.float64))
+    grad_out = torch.randn(shape, dtype=torch.float64, generator=torch.Generator().manual_seed(1))
+    actual = torch.autograd.grad(fn(q, k, v), (q, k, v), grad_out)
+
+    rq, rk, rv = (t.detach().clone().requires_grad_() for t in (q, k, v))
+    expected = torch.autograd.grad(reference_attention(rq, rk, rv, pairs_fn(shape[1])), (rq, rk, rv), grad_out)
+    for a, e in zip(actual, expected):
+        assert_close(a, e, atol=1e-10)
+
+
+def test_vectorized_gradcheck():
+    q, k, v = (t.requires_grad_() for t in random_qkv((1, 9, 2, 4), dtype=torch.float64))
+    assert torch.autograd.gradcheck(
+        lambda q, k, v: sliding_window_attention(q, k, v, 2, block_size=4), (q, k, v))
+
+
+# --- PyTorch bridge ---------------------------------------------------------------
+
+@needs_ma_core
+@pytest.mark.parametrize("sparse, causal", [(True, False), (False, False), (False, True)])
+def test_bridge_backward_matches_reference(sparse, causal):
+    """Gradients through MACoreAttentionFunction (eval mode) match the reference."""
+    shape = (2, 20, 2, 8)
+    q, k, v = (t.requires_grad_() for t in random_qkv(shape))
+    attention = MACoreAttention(sparse=sparse, window_size=4, use_causal_mask=causal).eval()
+    grad_out = torch.randn(shape, generator=torch.Generator().manual_seed(1))
+    actual = torch.autograd.grad(attention(q, k, v), (q, k, v), grad_out)
+
+    pairs = window_pairs(shape[1], 4) if sparse else full_pairs(shape[1], causal)
+    rq, rk, rv = (t.detach().clone().requires_grad_() for t in (q, k, v))
+    expected = torch.autograd.grad(reference_attention(rq, rk, rv, pairs), (rq, rk, rv), grad_out.double())
+    for a, e in zip(actual, expected):
+        assert_close(a, e, atol=1e-4)
+
+
+@needs_ma_core
+@pytest.mark.parametrize("sparse", [False, True])
+def test_bridge_when_seq_len_equals_num_heads(sparse):
+    """Regression: equal seq_len and num_heads used to trigger a silent transpose."""
+    shape = (1, 8, 8, 16)
+    q, k, v = random_qkv(shape)
+    out = MACoreAttention(sparse=sparse, window_size=2).eval()(q, k, v)
+    pairs = window_pairs(8, 2) if sparse else full_pairs(8)
+    assert_close(out, reference_attention(q, k, v, pairs))
+
+
+@needs_ma_core
+def test_bridge_rejects_mismatched_shapes():
+    q = torch.randn(1, 4, 2, 8)
+    v = torch.randn(1, 2, 4, 8)
+    with pytest.raises(ValueError):
+        MACoreAttention(sparse=False).eval()(q, q, v)
+
+
+@needs_ma_core
+@pytest.mark.parametrize("training", [False, True])
+def test_sparse_attention_backends_agree(training):
+    """The ma_core path and the PyTorch fallback use the same window definition."""
+    x = torch.randn(2, 40, 16, generator=torch.Generator().manual_seed(0))
+    with_core = SparseAttention(window_size=3).train(training)
+    fallback = SparseAttention(window_size=3, use_ma_core=False).train(training)
+    expected = reference_attention(x[:, :, None], x[:, :, None], x[:, :, None], window_pairs(40, 3))[:, :, 0]
+    assert_close(with_core(x, x, x), expected)
+    assert_close(fallback(x, x, x), expected)

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "attention_interface.hpp"
+#include "ma_core.hpp"
 #include <cmath>
 #include <algorithm>
 
@@ -7,78 +8,9 @@ namespace ma_core {
 
     // Dense Attention Implementation
     Tensor DenseAttention::forward(const Tensor& query, const Tensor& key, const Tensor& value) {
-        // Validate input dimensions
-        if (query.shape().sequence_length != key.shape().sequence_length ||
-            key.shape().sequence_length != value.shape().sequence_length) {
-            throw std::runtime_error("Query, key, and value must have the same sequence length");
-        }
-        
-        if (query.shape().head_dim != key.shape().head_dim) {
-            throw std::runtime_error("Query and key must have the same head dimension");
-        }
-
-        // Step 1: Scale queries
-        Tensor scaled_query = scale_query(query);
-        
-        // Step 2: Compute attention scores (Q @ K^T)
-        Tensor attention_scores = compute_attention_scores(scaled_query, key);
-        
-        // Step 3: Apply masks (causal, padding, etc.)
-        Tensor masked_scores = apply_attention_mask(attention_scores);
-        
-        // Step 4: Apply softmax to get attention weights
-        Tensor attention_weights = softmax(masked_scores);
-        
-        // Step 5: Apply dropout (if configured)
-        if (config_.dropout_prob > 0.0f) {
-            attention_weights = apply_attention_dropout(attention_weights);
-        }
-        
-        // Step 6: Apply attention to values (Attention @ V)
-        return matmul(attention_weights, value);
-    }
-
-    Tensor DenseAttention::compute_attention_scores(const Tensor& query, const Tensor& key) {
-        // For dense attention, compute full Q @ K^T
-        // Note: This is a simplified implementation
-        // In practice, we'd need proper matrix transpose and batch operations
-        
-        index_t seq_len = query.shape().sequence_length;
-        index_t head_dim = query.shape().head_dim;
-        index_t batch_size = query.shape().batch_size;
-        index_t num_heads = query.shape().num_heads;
-        
-        // Create result tensor [batch, seq, seq, 1] for attention scores
-        TensorShape score_shape(batch_size, seq_len, num_heads, seq_len);
-        Tensor scores(score_shape, query.device(), query.layout());
-        scores.zero();
-        
-        // Compute Q @ K^T for each batch and head
-        for (index_t b = 0; b < batch_size; ++b) {
-            for (index_t h = 0; h < num_heads; ++h) {
-                for (index_t i = 0; i < seq_len; ++i) {
-                    for (index_t j = 0; j < seq_len; ++j) {
-                        scalar_t score = 0.0f;
-                        for (index_t d = 0; d < head_dim; ++d) {
-                            score += query.at(b, i, h, d) * key.at(b, j, h, d);
-                        }
-                        scores.at(b, i, h, j) = score;
-                    }
-                }
-            }
-        }
-        
-        return scores;
-    }
-
-    Tensor DenseAttention::apply_attention_mask(const Tensor& attention_scores) {
-        Tensor masked_scores = attention_scores.copy();
-        
-        if (config_.use_causal_mask || config_.pattern == AttentionPattern::CAUSAL) {
-            masked_scores = apply_causal_mask(masked_scores);
-        }
-        
-        return masked_scores;
+        validate_inputs(query, key, value);
+        bool causal = config_.use_causal_mask || config_.pattern == AttentionPattern::CAUSAL;
+        return compute_dense_attention(query, key, value, causal);
     }
 
     SparseTensor DenseAttention::get_attention_pattern(const TensorShape& shape) const {
@@ -144,39 +76,26 @@ namespace ma_core {
     }
 
     // Helper functions implementation
-    Tensor AttentionBase::scale_query(const Tensor& query) const {
-        // Scale by 1/sqrt(d_k) for numerical stability
-        scalar_t scale = 1.0f / std::sqrt(static_cast<scalar_t>(query.shape().head_dim));
-        return multiply(query, scale);
-    }
-
-    Tensor AttentionBase::apply_causal_mask(const Tensor& attention_scores) const {
-        Tensor masked_scores = attention_scores.copy();
-        
-        index_t seq_len = attention_scores.shape().sequence_length;
-        index_t batch_size = attention_scores.shape().batch_size;
-        index_t num_heads = attention_scores.shape().num_heads;
-        
-        // Apply causal mask: set upper triangular part to -inf
-        const scalar_t mask_value = -1e9f;
-        
-        for (index_t b = 0; b < batch_size; ++b) {
-            for (index_t h = 0; h < num_heads; ++h) {
-                for (index_t i = 0; i < seq_len; ++i) {
-                    for (index_t j = i + 1; j < seq_len; ++j) {
-                        masked_scores.at(b, i, h, j) = mask_value;
-                    }
-                }
-            }
+    void AttentionBase::validate_inputs(const Tensor& query, const Tensor& key, const Tensor& value) const {
+        const TensorShape& q = query.shape();
+        const TensorShape& k = key.shape();
+        const TensorShape& v = value.shape();
+        if (q.sequence_length != k.sequence_length || k.sequence_length != v.sequence_length) {
+            throw std::runtime_error("Query, key, and value must have the same sequence length");
         }
-        
-        return masked_scores;
-    }
-
-    Tensor AttentionBase::apply_attention_dropout(const Tensor& attention_weights) const {
-        // Simple dropout implementation (would need proper random number generation)
-        // For now, just return the input unchanged
-        return attention_weights.copy();
+        if (q.batch_size != k.batch_size || k.batch_size != v.batch_size) {
+            throw std::runtime_error("Query, key, and value must have the same batch size");
+        }
+        if (q.num_heads != k.num_heads || k.num_heads != v.num_heads) {
+            throw std::runtime_error("Query, key, and value must have the same number of heads");
+        }
+        if (q.head_dim != k.head_dim) {
+            throw std::runtime_error("Query and key must have the same head dimension");
+        }
+        if (config_.dropout_prob > 0.0f) {
+            throw std::invalid_argument(
+                "Attention dropout is not implemented in ma_core; apply dropout in PyTorch instead");
+        }
     }
 
 } // namespace ma_core

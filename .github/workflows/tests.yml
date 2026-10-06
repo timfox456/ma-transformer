@@ -1,0 +1,39 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    name: Python (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CPU PyTorch (Linux)
+        if: runner.os == 'Linux'
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install package and test dependencies
+        run: pip install -e . psutil
+      - name: Run tests
+        run: python -m pytest tests/python tests/integration
+
+  cpp:
+    name: C++ (GoogleTest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -S tests/cpp -B build-cpp -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-cpp -j 4
+      - name: Run
+        run: ctest --test-dir build-cpp --output-on-failure

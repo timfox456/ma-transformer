@@ -15,13 +15,12 @@ namespace ma_core {
 
     Tensor::Tensor(scalar_t* data, const TensorShape& shape, Device device, 
                    MemoryLayout layout, bool owns_data)
-        : data_(owns_data ? nullptr : data), shape_(shape), device_(device), 
-          layout_(layout), owns_data_(owns_data) {
+        : shape_(shape), device_(device), layout_(layout), owns_data_(owns_data) {
         if (owns_data) {
             allocate_memory();
             std::memcpy(data_.get(), data, size() * sizeof(scalar_t));
         } else {
-            data_.reset(data);
+            data_ = std::unique_ptr<scalar_t[], Deleter>(data, &no_delete);
         }
     }
 
@@ -115,7 +114,7 @@ namespace ma_core {
 
     void Tensor::allocate_memory() {
         if (size() > 0) {
-            data_ = std::make_unique<scalar_t[]>(size());
+            data_ = std::unique_ptr<scalar_t[], Deleter>(new scalar_t[size()](), &delete_array);
         }
     }
 

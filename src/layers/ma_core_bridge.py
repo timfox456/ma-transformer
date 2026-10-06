@@ -11,6 +11,8 @@ import ma_core
 import numpy as np
 from typing import Optional, Tuple
 
+from .blocked_attention import sliding_window_attention
+
 # Optional CUDA sparse attention extension
 import os
 import sys
@@ -137,20 +139,20 @@ class MACoreAttentionFunction(torch.autograd.Function):
                    dK if ctx.needs_input_grad[1] else None, \
                    dV if ctx.needs_input_grad[2] else None, None, None, None
 
-        # Fallback: Use PyTorch implementation for gradients
-        if ctx.sparse:
-            output = pytorch_sparse_attention(query, key, value, ctx.window_size)
-        else:
-            output = pytorch_dense_attention(query, key, value, ctx.use_causal_mask)
+        # Fallback: recompute the forward pass with the PyTorch reference
+        # implementation and differentiate it. Autograd is disabled inside
+        # backward(), so re-enable it on fresh leaf copies of the inputs.
+        with torch.enable_grad():
+            inputs = [t.detach().requires_grad_(needs)
+                      for t, needs in zip((query, key, value), ctx.needs_input_grad[:3])]
+            if ctx.sparse:
+                output = pytorch_sparse_attention(*inputs, ctx.window_size)
+            else:
+                output = pytorch_dense_attention(*inputs, ctx.use_causal_mask)
+            wanted = [t for t in inputs if t.requires_grad]
+            grads = iter(torch.autograd.grad(output, wanted, grad_output) if wanted else ())
 
-        # Compute gradients using PyTorch autograd
-        query_grad = key_grad = value_grad = None
-        if ctx.needs_input_grad[0]:
-            query_grad = torch.autograd.grad(output, query, grad_output, retain_graph=True)[0]
-        if ctx.needs_input_grad[1]:
-            key_grad = torch.autograd.grad(output, key, grad_output, retain_graph=True)[0]
-        if ctx.needs_input_grad[2]:
-            value_grad = torch.autograd.grad(output, value, grad_output, retain_graph=True)[0]
+        query_grad, key_grad, value_grad = (next(grads) if t.requires_grad else None for t in inputs)
         return query_grad, key_grad, value_grad, None, None, None
 
 
@@ -223,28 +225,11 @@ def pytorch_dense_attention(query: torch.Tensor, key: torch.Tensor, value: torch
 
 def pytorch_sparse_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                             window_size: int = 64) -> torch.Tensor:
-    """PyTorch reference implementation of sparse attention (differentiable)."""
-    batch_size, seq_len, num_heads, head_dim = query.shape
-    scale = 1.0 / (head_dim ** 0.5)
+    """PyTorch reference implementation of sliding-window sparse attention (differentiable).
 
-    outputs = []
-    for b in range(batch_size):
-        rows = []
-        for i in range(seq_len):
-            start_j = max(0, i - window_size)
-            end_j = min(seq_len, i + window_size + 1)
-            row_heads = []
-            for h in range(num_heads):
-                q_i = query[b, i, h, :] * scale  # [D]
-                k_window = key[b, start_j:end_j, h, :]  # [W, D]
-                v_window = value[b, start_j:end_j, h, :]  # [W, D]
-                scores = torch.matmul(k_window, q_i)  # [W]
-                attention_weights = torch.softmax(scores, dim=0)  # [W]
-                out_vec = torch.matmul(attention_weights, v_window)  # [D]
-                row_heads.append(out_vec)
-            rows.append(torch.stack(row_heads, dim=0))  # [H, D]
-        outputs.append(torch.stack(rows, dim=0))  # [S, H, D]
-    return torch.stack(outputs, dim=0)  # [B, S, H, D]
+    Each query i attends to keys j with |i - j| <= window_size, matching ma_core.
+    """
+    return sliding_window_attention(query, key, value, window_size)
 
 
 class MACoreAttention(nn.Module):
@@ -296,12 +281,6 @@ class MACoreAttention(nn.Module):
         # Validate inputs early for clear error messages
         if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
             raise ValueError("Expected tensors with shape [batch, seq_len, num_heads, head_dim]")
-        # Auto-correct a common layout mix-up where seq_len and num_heads are swapped in Q/K
-        if (query.shape[0] == value.shape[0] and query.shape[1] == value.shape[2]
-            and query.shape[2] == value.shape[1] and query.shape[3] == value.shape[3]
-            and key.shape == query.shape):
-            query = query.transpose(1, 2).contiguous()
-            key = key.transpose(1, 2).contiguous()
         if query.shape != key.shape or key.shape != value.shape:
             raise ValueError(
                 "Tensor size mismatch: query, key, and value must have identical shapes "

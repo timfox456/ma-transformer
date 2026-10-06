@@ -17,15 +17,8 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        return x + self.pe[:x.size(0), :]
-
-class TransformerModel(nn.Module):
-    def __init__(self, input_dim, model_dim, num_heads, num_layers, dropout=0.1):
-        super(TransformerModel, self).__init__()
-        self.model_dim = model_dim
-        self.encoder = nn.Linear(input_dim, model_dim)
-        self.pos_encoder = PositionalEncoding(model_dim)
-        from src.layers.sparse_attention import SparseAttention
+        # x is [batch, seq, d_model]; pe is stored as [max_len, 1, d_model]
+        return x + self.pe[:x.size(1)].transpose(0, 1)
 
 class CustomTransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, num_heads, dropout=0.1, window_size=3):

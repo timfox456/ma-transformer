@@ -264,6 +264,9 @@ class TestEdgeCases:
                              [1., 0., 0., 0.],
                              [0., 0., 0., 1.],
                              [0., 0., 1., 0.]]]], dtype=torch.float32)
+        # Each row above is one sequence position: [batch, seq, heads, dim]
+        query = query.reshape(batch_size, seq_len, num_heads, head_dim)
+        key = key.reshape(batch_size, seq_len, num_heads, head_dim)
         
         value = torch.randn(batch_size, seq_len, num_heads, head_dim)
         

@@ -4,6 +4,8 @@
 #include "tensor.hpp"
 #include "attention_types.hpp"
 #include <memory>
+#include <tuple>
+#include <vector>
 
 namespace ma_core {
 
@@ -47,10 +49,9 @@ namespace ma_core {
         AttentionConfig config_;
         Device device_;
 
-        // Helper functions for all attention types
-        Tensor apply_causal_mask(const Tensor& attention_scores) const;
-        Tensor apply_attention_dropout(const Tensor& attention_weights) const;
-        Tensor scale_query(const Tensor& query) const;
+        // Checks that Q, K and V agree on batch, sequence, heads and head_dim,
+        // and rejects options the engine does not implement (dropout).
+        void validate_inputs(const Tensor& query, const Tensor& key, const Tensor& value) const;
     };
 
     /**
@@ -69,8 +70,6 @@ namespace ma_core {
 
     protected:
         SparseTensor generate_sparse_pattern(const TensorShape& shape) const override;
-        virtual Tensor compute_attention_scores(const Tensor& query, const Tensor& key);
-        virtual Tensor apply_attention_mask(const Tensor& attention_scores);
     };
 
     /**
@@ -88,12 +87,13 @@ namespace ma_core {
         bool supports_device(Device device) const override;
 
     protected:
-        virtual Tensor compute_sparse_attention_scores(const Tensor& query, const Tensor& key,
-                                                       const SparseTensor& pattern);
-        Tensor apply_sparse_softmax(const Tensor& scores, const SparseTensor& pattern);
-        Tensor compute_sparse_attention_output(const Tensor& attention_weights, 
-                                             const Tensor& value, 
-                                             const SparseTensor& pattern);
+        // Pattern in compressed-row form: the keys for query i are
+        // cols[row_ptr[i] .. row_ptr[i+1]), sorted and free of duplicates.
+        struct RowIndex {
+            std::vector<index_t> row_ptr;
+            std::vector<index_t> cols;
+        };
+        static RowIndex build_row_index(const SparseTensor& pattern, index_t seq_len);
     };
 
     /**
