@@ -19,11 +19,11 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 
 from layers.blocked_attention import financial_attention, sliding_window_attention  # noqa: E402
+from layers.sparse_attention import SparseAttention  # noqa: E402
 
 try:
     import ma_core
     from layers.ma_core_bridge import MACoreAttention, ma_core_to_pytorch, pytorch_to_ma_core
-    from layers.sparse_attention import SparseAttention
     HAS_MA_CORE = True
 except ImportError:
     HAS_MA_CORE = False
@@ -245,3 +245,106 @@ def test_sparse_attention_backends_agree(training):
     expected = reference_attention(x[:, :, None], x[:, :, None], x[:, :, None], window_pairs(40, 3))[:, :, 0]
     assert_close(with_core(x, x, x), expected)
     assert_close(fallback(x, x, x), expected)
+
+
+# --- Metal (MPS) kernels -------------------------------------------------------
+
+from layers import attention_backends, mps_attention  # noqa: E402
+
+needs_mps_kernels = pytest.mark.skipif(not mps_attention.is_available(), reason="MPS kernels unavailable")
+
+MPS_CASES = [
+    ("window", lambda S: window_pairs(S, 5), lambda: mps_attention.window_segments(5)),
+    ("causal", lambda S: window_pairs(S, 7, causal=True), lambda: mps_attention.window_segments(7, causal=True)),
+    ("financial", lambda S: financial_pairs(S, **FIN_SMALL), lambda: mps_attention.financial_segments(**FIN_SMALL)),
+]
+# (shape, kernels to test); seq lengths include ones that are not multiples of the 32-row tile
+MPS_SHAPES = [
+    ((1, 1, 1, 8), ("tiled", "row")),
+    ((2, 17, 3, 16), ("tiled", "row")),
+    ((2, 300, 2, 64), ("tiled", "row")),
+    ((1, 70, 2, 128), ("tiled", "row")),
+    ((1, 45, 2, 20), ("row",)),
+    ((1, 33, 1, 256), ("row",)),
+]
+
+
+def mps_params():
+    for shape, kernels in MPS_SHAPES:
+        for kernel in kernels:
+            for name, pairs_fn, segments_fn in MPS_CASES:
+                yield pytest.param(shape, kernel, pairs_fn, segments_fn, id=f"{name}-{kernel}-{'x'.join(map(str, shape))}")
+
+
+@needs_mps_kernels
+@pytest.mark.parametrize("shape, kernel, pairs_fn, segments_fn", list(mps_params()))
+def test_mps_kernels_match_reference(shape, kernel, pairs_fn, segments_fn):
+    q, k, v = (t.requires_grad_() for t in random_qkv(shape, device="mps"))
+    grad_out = torch.randn(shape, generator=torch.Generator().manual_seed(1))
+    out = mps_attention.segment_attention(q, k, v, segments_fn(), kernel=kernel)
+    grads = torch.autograd.grad(out, (q, k, v), grad_out.to("mps"))
+
+    rq, rk, rv = (t.detach().cpu().double().requires_grad_() for t in (q, k, v))
+    expected = reference_attention(rq, rk, rv, pairs_fn(shape[1]))
+    expected_grads = torch.autograd.grad(expected, (rq, rk, rv), grad_out.double())
+    assert out.device.type == "mps"
+    assert_close(out, expected.detach(), atol=1e-4)
+    for actual, wanted in zip(grads, expected_grads):
+        assert_close(actual, wanted, atol=1e-4)
+
+
+@needs_mps_kernels
+@pytest.mark.parametrize("kernel", ["tiled", "row"])
+def test_mps_financial_default_config(kernel):
+    shape = (1, 2100, 2, 64)
+    q, k, v = random_qkv(shape, device="mps")
+    out = mps_attention.financial_attention(q, k, v, kernel=kernel)
+    defaults = dict(local_window_size=512, dilation_stride=1000, dilation_cluster_size=8, dilation_num_clusters=10)
+    assert_close(out, reference_attention(q, k, v, financial_pairs(shape[1], **defaults)), atol=1e-4)
+
+
+@needs_mps_kernels
+def test_mps_kernels_keep_dtype():
+    q, k, v = random_qkv((1, 40, 2, 16), device="mps")
+    out = mps_attention.sliding_window_attention(q.half(), k.half(), v.half(), 3)
+    assert out.dtype == torch.float16
+    assert_close(out, reference_attention(q, k, v, window_pairs(40, 3)), atol=5e-3)
+
+
+@needs_mps_kernels
+def test_mps_kernels_reject_bad_input():
+    q = torch.randn(1, 8, 1, 16, device="mps")
+    with pytest.raises(ValueError):
+        mps_attention.segment_attention(q.cpu(), q.cpu(), q.cpu(), [(-1, 1)])
+    with pytest.raises(ValueError):
+        mps_attention.segment_attention(q, q, q, [(2, 1)])
+    with pytest.raises(ValueError):
+        mps_attention.segment_attention(q[..., :12], q[..., :12], q[..., :12], [(-1, 1)], kernel="tiled")
+
+
+@needs_mps_kernels
+def test_layers_dispatch_to_mps_kernels(monkeypatch):
+    calls = []
+    original = mps_attention.segment_attention
+    monkeypatch.setattr(mps_attention, "segment_attention",
+                        lambda *args, **kwargs: calls.append(1) or original(*args, **kwargs))
+    x = torch.randn(2, 40, 16, device="mps", requires_grad=True)
+    expected = reference_attention(x[:, :, None], x[:, :, None], x[:, :, None], window_pairs(40, 3))[:, :, 0]
+
+    for use_ma_core in ([True, False] if HAS_MA_CORE else [False]):
+        for training in (True, False):
+            layer = SparseAttention(window_size=3, use_ma_core=use_ma_core).train(training)
+            out = layer(x, x, x)
+            out.sum().backward()
+            assert out.device.type == "mps"
+            assert_close(out, expected.detach(), atol=1e-4)
+    assert calls, "SparseAttention on MPS did not use the Metal kernels"
+
+
+@needs_mps_kernels
+def test_mps_kernels_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("MA_DISABLE_MPS_KERNELS", "1")
+    q, k, v = random_qkv((1, 30, 2, 16), device="mps")
+    assert not mps_attention.supports(q)
+    out = attention_backends.sliding_window_attention(q, k, v, 4)
+    assert_close(out, reference_attention(q, k, v, window_pairs(30, 4)), atol=1e-4)

@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 
-from .blocked_attention import sliding_window_attention
+from .attention_backends import sliding_window_attention
 
 # Check if ma_core C++ extension is available
 try:
