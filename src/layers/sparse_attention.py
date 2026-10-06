@@ -2,8 +2,8 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import math
+
+from .blocked_attention import sliding_window_attention
 
 # Check if ma_core C++ extension is available
 try:
@@ -15,19 +15,12 @@ except ImportError:
     MA_CORE_AVAILABLE = False
     print("ma_core extension not available. Falling back to PyTorch implementation.")
 
-# Legacy CUDA check for backward compatibility
-try:
-    import ma_transformer_cuda
-    CUDA_AVAILABLE = True
-except ImportError:
-    CUDA_AVAILABLE = False
-
-
 class SparseAttention(nn.Module):
     """
     Sparse Attention layer with multiple implementation backends.
-    Priority: ma_core C++ > CUDA > PyTorch fallback.
-    Uses a sliding window attention pattern.
+    Priority: ma_core bridge (C++ on CPU, CUDA kernels on GPU) > PyTorch fallback.
+    Uses a sliding window attention pattern: query i attends to keys j with
+    |i - j| <= window_size.
     """
     def __init__(self, window_size=3, use_ma_core=True):
         super(SparseAttention, self).__init__()
@@ -76,35 +69,9 @@ class SparseAttention(nn.Module):
         if MA_CORE_AVAILABLE and self.use_ma_core and hasattr(self, 'ma_core_attention'):
             output = self.ma_core_attention(q_reshaped, k_reshaped, v_reshaped)
             return output.squeeze(2)  # Remove head dimension
-        
-        # Fall back to CUDA implementation if available
-        elif self.training is False and CUDA_AVAILABLE:
-            return ma_transformer_cuda.forward(q, k, v)
-        
-        # Fall back to PyTorch implementation
-        else:
-            return self._pytorch_forward(q, k, v)
+
+        return self._pytorch_forward(q, k, v)
 
     def _pytorch_forward(self, q, k, v):
-        batch_size, seq_len, model_dim = q.size()
-        
-        # Scale queries
-        q = q / math.sqrt(model_dim)
-
-        # Create a sliding window mask
-        mask = torch.ones(seq_len, seq_len, device=q.device).tril(self.window_size - 1).triu(-self.window_size + 1)
-        mask = mask.bool()
-
-        # Calculate attention scores
-        attn_scores = torch.matmul(q, k.transpose(-2, -1))
-
-        # Apply the mask
-        attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
-
-        # Apply softmax to get attention weights
-        attn_weights = F.softmax(attn_scores, dim=-1)
-
-        # Apply attention weights to values
-        output = torch.matmul(attn_weights, v)
-        
-        return output
+        out = sliding_window_attention(q.unsqueeze(2), k.unsqueeze(2), v.unsqueeze(2), self.window_size)
+        return out.squeeze(2)

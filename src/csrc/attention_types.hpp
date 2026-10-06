@@ -75,8 +75,10 @@ namespace ma_core {
         index_t head_dim;
         index_t num_heads;
         
-        TensorShape(index_t b, index_t s, index_t h, index_t d) 
-            : batch_size(b), sequence_length(s), head_dim(h), num_heads(d) {}
+        // Note the argument order: head_dim comes before num_heads, which is
+        // the reverse of the [batch, seq, heads, dim] memory layout.
+        TensorShape(index_t batch, index_t seq, index_t head_dim_, index_t num_heads_)
+            : batch_size(batch), sequence_length(seq), head_dim(head_dim_), num_heads(num_heads_) {}
         
         index_t total_elements() const {
             return batch_size * sequence_length * head_dim * num_heads;

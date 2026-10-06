@@ -33,3 +33,7 @@ build/
 dist/
 *.egg-info/
 *.so
+
+# Build outputs
+tests/cpp/ma_core_tests
+*.log

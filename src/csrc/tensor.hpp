@@ -15,7 +15,12 @@ namespace ma_core {
      */
     class Tensor {
     private:
-        std::unique_ptr<scalar_t[]> data_;
+        // The deleter is a no-op for tensors that wrap caller-owned memory
+        using Deleter = void (*)(scalar_t*);
+        static void delete_array(scalar_t* p) { delete[] p; }
+        static void no_delete(scalar_t*) {}
+
+        std::unique_ptr<scalar_t[], Deleter> data_{nullptr, &delete_array};
         TensorShape shape_;
         Device device_;
         MemoryLayout layout_;

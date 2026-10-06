@@ -4,153 +4,85 @@
 #include <algorithm>
 #include <random>
 #include <set>
+#include <limits>
 #include <map>
 
 namespace ma_core {
 
     // Base Sparse Attention Implementation
     Tensor SparseAttention::forward(const Tensor& query, const Tensor& key, const Tensor& value) {
-        // Validate input dimensions (same as dense attention)
-        if (query.shape().sequence_length != key.shape().sequence_length ||
-            key.shape().sequence_length != value.shape().sequence_length) {
-            throw std::runtime_error("Query, key, and value must have the same sequence length");
-        }
-        
-        if (query.shape().head_dim != key.shape().head_dim) {
-            throw std::runtime_error("Query and key must have the same head dimension");
+        validate_inputs(query, key, value);
+        if (query.layout() != MemoryLayout::NWHD || key.layout() != MemoryLayout::NWHD ||
+            value.layout() != MemoryLayout::NWHD) {
+            throw std::runtime_error("Sparse attention requires [batch, seq, heads, dim] (NWHD) tensors");
         }
 
-        // Step 1: Generate sparse attention pattern
-        SparseTensor pattern = generate_sparse_pattern(query.shape());
-        
-        // Step 2: Scale queries
-        Tensor scaled_query = scale_query(query);
-        
-        // Step 3: Compute sparse attention scores
-        Tensor attention_scores = compute_sparse_attention_scores(scaled_query, key, pattern);
-        
-        // Step 4: Apply sparse softmax
-        Tensor attention_weights = apply_sparse_softmax(attention_scores, pattern);
-        
-        // Step 5: Apply dropout (if configured)
-        if (config_.dropout_prob > 0.0f) {
-            attention_weights = apply_attention_dropout(attention_weights);
-        }
-        
-        // Step 6: Apply attention to values (sparse attention @ V)
-        return compute_sparse_attention_output(attention_weights, value, pattern);
-    }
+        const index_t batch_size = query.shape().batch_size;
+        const index_t seq_len = query.shape().sequence_length;
+        const index_t num_heads = query.shape().num_heads;
+        const index_t head_dim = query.shape().head_dim;
+        const index_t value_dim = value.shape().head_dim;
 
-    Tensor SparseAttention::compute_sparse_attention_scores(const Tensor& query, const Tensor& key,
-                                                           const SparseTensor& pattern) {
-        // Create a tensor to store only the non-zero attention scores
-        index_t batch_size = query.shape().batch_size;
-        index_t seq_len = query.shape().sequence_length;
-        index_t num_heads = query.shape().num_heads;
-        index_t head_dim = query.shape().head_dim;
-        
-        // For simplicity, create a full tensor but only compute values for sparse positions
-        TensorShape score_shape(batch_size, seq_len, num_heads, seq_len);
-        Tensor scores(score_shape, query.device(), query.layout());
-        scores.fill(-1e9f); // Initialize with very negative values (will be masked)
-        
-        // Compute scores only for positions in the sparse pattern
-        for (index_t b = 0; b < batch_size; ++b) {
-            for (index_t h = 0; h < num_heads; ++h) {
-                for (size_t idx = 0; idx < pattern.values.size(); ++idx) {
-                    index_t i = pattern.row_indices[idx];
-                    index_t j = pattern.col_indices[idx];
-                    
-                    if (i < seq_len && j < seq_len) {
-                        scalar_t score = 0.0f;
-                        for (index_t d = 0; d < head_dim; ++d) {
-                            score += query.at(b, i, h, d) * key.at(b, j, h, d);
-                        }
-                        scores.at(b, i, h, j) = score;
-                    }
-                }
-            }
-        }
-        
-        return scores;
-    }
+        RowIndex rows = build_row_index(generate_sparse_pattern(query.shape()), seq_len);
 
-    Tensor SparseAttention::apply_sparse_softmax(const Tensor& scores, const SparseTensor& pattern) {
-        Tensor result = scores.copy();
-        index_t seq_len = scores.shape().sequence_length;
-        index_t batch_size = scores.shape().batch_size;
-        index_t num_heads = scores.shape().num_heads;
-        
-        // Pre-group sparse entries by row for efficiency
-        std::vector<std::vector<index_t>> row_to_cols(seq_len);
-        for (size_t idx = 0; idx < pattern.values.size(); ++idx) {
-            index_t i = pattern.row_indices[idx];
-            if (i < seq_len) {
-                row_to_cols[i].push_back(pattern.col_indices[idx]);
-            }
+        index_t max_row = 0;
+        for (index_t i = 0; i < seq_len; ++i) {
+            max_row = std::max(max_row, rows.row_ptr[i + 1] - rows.row_ptr[i]);
         }
-
-        // Apply softmax row-wise, but only consider non-masked positions
-        for (index_t b = 0; b < batch_size; ++b) {
-            for (index_t h = 0; h < num_heads; ++h) {
-                for (index_t i = 0; i < seq_len; ++i) {
-                    const auto& valid_positions = row_to_cols[i];
-                    
-                    if (valid_positions.empty()) continue;
-                    
-                    // Find max for numerical stability
-                    scalar_t max_val = result.at(b, i, h, valid_positions[0]);
-                    for (index_t j : valid_positions) {
-                        max_val = std::max(max_val, result.at(b, i, h, j));
-                    }
-                    
-                    // Compute exp and sum
-                    scalar_t sum = 0.0f;
-                    for (index_t j : valid_positions) {
-                        scalar_t exp_val = std::exp(result.at(b, i, h, j) - max_val);
-                        result.at(b, i, h, j) = exp_val;
-                        sum += exp_val;
-                    }
-                    
-                    // Normalize
-                    for (index_t j : valid_positions) {
-                        result.at(b, i, h, j) /= sum;
-                    }
-                }
-            }
-        }
-        
-        return result;
-    }
-
-    Tensor SparseAttention::compute_sparse_attention_output(const Tensor& attention_weights,
-                                                           const Tensor& value,
-                                                           const SparseTensor& pattern) {
-        index_t batch_size = value.shape().batch_size;
-        index_t seq_len = value.shape().sequence_length;
-        index_t num_heads = value.shape().num_heads;
-        index_t head_dim = value.shape().head_dim;
 
         Tensor output(value.shape(), value.device(), value.layout());
         output.zero();
 
-        // Pre-group pattern entries by row (pattern is independent of batch/head)
-        std::vector<std::vector<index_t>> row_to_cols(seq_len);
-        for (size_t idx = 0; idx < pattern.values.size(); ++idx) {
-            index_t i = pattern.row_indices[idx];
-            if (i < seq_len) {
-                row_to_cols[i].push_back(pattern.col_indices[idx]);
-            }
-        }
+        const scalar_t scale = 1.0f / std::sqrt(static_cast<scalar_t>(head_dim));
+        const scalar_t* q_data = query.data();
+        const scalar_t* k_data = key.data();
+        const scalar_t* v_data = value.data();
+        scalar_t* o_data = output.data();
 
-        // Sparse output = attention_weights @ value
+        // Row strides in the NWHD layout: consecutive sequence positions are
+        // num_heads * dim elements apart.
+        const index_t qk_seq_stride = num_heads * head_dim;
+        const index_t v_seq_stride = num_heads * value_dim;
+
+        // Scores for one query row at a time: O(max keys per row) scratch
+        // instead of an O(seq_len^2) score matrix.
+        std::vector<scalar_t> weights(static_cast<size_t>(max_row));
+
         for (index_t b = 0; b < batch_size; ++b) {
             for (index_t h = 0; h < num_heads; ++h) {
+                const index_t qk_base = b * seq_len * qk_seq_stride + h * head_dim;
+                const index_t v_base = b * seq_len * v_seq_stride + h * value_dim;
+
                 for (index_t i = 0; i < seq_len; ++i) {
-                    for (index_t j : row_to_cols[i]) {
-                        scalar_t weight = attention_weights.at(b, i, h, j);
+                    const index_t begin = rows.row_ptr[i];
+                    const index_t end = rows.row_ptr[i + 1];
+                    if (begin == end) continue;
+
+                    const scalar_t* q_row = q_data + qk_base + i * qk_seq_stride;
+                    scalar_t max_score = -std::numeric_limits<scalar_t>::infinity();
+                    for (index_t n = begin; n < end; ++n) {
+                        const scalar_t* k_row = k_data + qk_base + rows.cols[n] * qk_seq_stride;
+                        scalar_t score = 0.0f;
                         for (index_t d = 0; d < head_dim; ++d) {
-                            output.at(b, i, h, d) += weight * value.at(b, j, h, d);
+                            score += q_row[d] * k_row[d];
+                        }
+                        score *= scale;
+                        weights[n - begin] = score;
+                        max_score = std::max(max_score, score);
+                    }
+
+                    scalar_t sum = 0.0f;
+                    for (index_t n = 0; n < end - begin; ++n) {
+                        weights[n] = std::exp(weights[n] - max_score);
+                        sum += weights[n];
+                    }
+
+                    scalar_t* o_row = o_data + v_base + i * v_seq_stride;
+                    for (index_t n = begin; n < end; ++n) {
+                        const scalar_t w = weights[n - begin] / sum;
+                        const scalar_t* v_row = v_data + v_base + rows.cols[n] * v_seq_stride;
+                        for (index_t d = 0; d < value_dim; ++d) {
+                            o_row[d] += w * v_row[d];
                         }
                     }
                 }
@@ -158,6 +90,54 @@ namespace ma_core {
         }
 
         return output;
+    }
+
+    SparseAttention::RowIndex SparseAttention::build_row_index(const SparseTensor& pattern, index_t seq_len) {
+        RowIndex rows;
+        rows.row_ptr.assign(static_cast<size_t>(seq_len) + 1, 0);
+
+        auto in_range = [seq_len](index_t i, index_t j) {
+            return i >= 0 && i < seq_len && j >= 0 && j < seq_len;
+        };
+
+        // Counting sort of the COO entries by row
+        for (size_t n = 0; n < pattern.row_indices.size(); ++n) {
+            if (in_range(pattern.row_indices[n], pattern.col_indices[n])) {
+                ++rows.row_ptr[pattern.row_indices[n] + 1];
+            }
+        }
+        for (index_t i = 0; i < seq_len; ++i) {
+            rows.row_ptr[i + 1] += rows.row_ptr[i];
+        }
+        rows.cols.resize(static_cast<size_t>(rows.row_ptr[seq_len]));
+        std::vector<index_t> cursor(rows.row_ptr.begin(), rows.row_ptr.end() - 1);
+        for (size_t n = 0; n < pattern.row_indices.size(); ++n) {
+            index_t i = pattern.row_indices[n];
+            index_t j = pattern.col_indices[n];
+            if (in_range(i, j)) {
+                rows.cols[cursor[i]++] = j;
+            }
+        }
+
+        // Sort each row and drop duplicate keys, which would otherwise be
+        // counted twice in the softmax denominator.
+        index_t write = 0;
+        index_t row_begin = 0;
+        for (index_t i = 0; i < seq_len; ++i) {
+            const index_t row_end = rows.row_ptr[i + 1];
+            auto first = rows.cols.begin() + row_begin;
+            auto last = rows.cols.begin() + row_end;
+            std::sort(first, last);
+            last = std::unique(first, last);
+            const index_t unique_len = static_cast<index_t>(last - first);
+            std::move(first, last, rows.cols.begin() + write);
+            rows.row_ptr[i] = write;
+            write += unique_len;
+            row_begin = row_end;
+        }
+        rows.row_ptr[seq_len] = write;
+        rows.cols.resize(static_cast<size_t>(write));
+        return rows;
     }
 
     SparseTensor SparseAttention::get_attention_pattern(const TensorShape& shape) const {
@@ -246,24 +226,29 @@ namespace ma_core {
         index_t window_size = config_.window_size;
         index_t num_global = config_.num_global_tokens;
         
-        // Add sliding window attention
+        const index_t global_end = std::min(num_global, seq_len);
+
         for (index_t i = 0; i < seq_len; ++i) {
+            // Global tokens attend to every position
+            if (i < global_end) {
+                for (index_t j = 0; j < seq_len; ++j) {
+                    pattern.add_entry(i, j, 1.0f);
+                }
+                continue;
+            }
+
+            // Every other token attends to the global tokens and its local
+            // window. Global tokens inside the window are added only once.
             index_t start = std::max(static_cast<index_t>(0), i - window_size);
             index_t end = std::min(seq_len, i + window_size + 1);
-            
+            for (index_t j = 0; j < std::min(global_end, start); ++j) {
+                pattern.add_entry(i, j, 1.0f);
+            }
             for (index_t j = start; j < end; ++j) {
                 pattern.add_entry(i, j, 1.0f);
             }
         }
-        
-        // Add global attention for first num_global tokens
-        for (index_t i = 0; i < std::min(num_global, seq_len); ++i) {
-            for (index_t j = 0; j < seq_len; ++j) {
-                pattern.add_entry(i, j, 1.0f); // Global tokens attend to all
-                pattern.add_entry(j, i, 1.0f); // All tokens attend to global tokens
-            }
-        }
-        
+
         return pattern;
     }
 

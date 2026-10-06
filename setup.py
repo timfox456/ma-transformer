@@ -13,7 +13,7 @@ _cuda_ext = None
 _cmdclass = {'build_ext': build_ext}
 try:
     import torch  # noqa: F401
-    from torch.utils.cpp_extension import CUDAExtension, CppExtension, BuildExtension
+    from torch.utils.cpp_extension import CUDAExtension, BuildExtension
     from torch.utils.cpp_extension import CUDA_HOME
     _has_torch = True
     # Build CUDA extension if a toolkit is discoverable either via CUDA_HOME or nvcc on PATH
@@ -28,14 +28,8 @@ try:
             extra_compile_args={'cxx': ['-O3', '-std=c++17'], 'nvcc': ['-O3']},
         )
         _cmdclass = {'build_ext': BuildExtension}
-    else:
-        # Fallback: build an ATen-only extension that implements the same API
-        _cuda_ext = CppExtension(
-            name='sparse_attention_cuda',
-            sources=['src/cuda/sparse_attention_stubs.cpp'],
-            extra_compile_args=['-O3', '-std=c++17'],
-        )
-        _cmdclass = {'build_ext': BuildExtension}
+    # Without a CUDA toolkit the extension is skipped; the PyTorch bridge
+    # falls back to the ma_core CPU engine or PyTorch implementations.
 except Exception:
     # Torch not available or no CUDA toolchain; skip CUDA extension
     _has_torch = False
