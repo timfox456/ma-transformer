@@ -11,7 +11,7 @@ import ma_core
 import numpy as np
 from typing import Optional, Tuple
 
-from .blocked_attention import sliding_window_attention
+from .attention_backends import sliding_window_attention
 
 # Optional CUDA sparse attention extension
 import os
@@ -225,9 +225,10 @@ def pytorch_dense_attention(query: torch.Tensor, key: torch.Tensor, value: torch
 
 def pytorch_sparse_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                             window_size: int = 64) -> torch.Tensor:
-    """PyTorch reference implementation of sliding-window sparse attention (differentiable).
+    """Differentiable sliding-window sparse attention outside the ma_core engine.
 
     Each query i attends to keys j with |i - j| <= window_size, matching ma_core.
+    Uses the Metal kernels for MPS tensors and vectorized PyTorch otherwise.
     """
     return sliding_window_attention(query, key, value, window_size)
 
@@ -292,8 +293,10 @@ class MACoreAttention(nn.Module):
         if self.sparse and (self.window_size <= 0):
             raise ValueError("window_size must be > 0 for sparse attention")
 
-        # During training, optionally fall back to PyTorch for gradient compatibility
-        if self.training and self.fallback_training:
+        # During training, optionally fall back to PyTorch for gradient compatibility.
+        # MPS tensors always take this path: the ma_core engine is CPU-only, and
+        # the sparse path runs on the Metal kernels with native autograd.
+        if (self.training and self.fallback_training) or query.device.type == "mps":
             # Ensure gradients are retained on non-leaf inputs (common in tests)
             for t in (query, key, value):
                 if t.requires_grad and t.grad_fn is not None:

@@ -205,10 +205,13 @@ param_grid:
 │   ├── init.py
 │   ├── models/               # PyTorch model definitions
 │   │   └��─ ma_transformer.py
-│   ├── layers/               # PyTorch wrappers for custom CUDA layers
-│   │   ├── init.py
-│   │   ├── sparse_attention.py
-│   │   └── fused_mlp.py
+│   ├── layers/               # PyTorch attention layers and backends
+│   │   ├── __init__.py
+│   │   ├── sparse_attention.py   # SparseAttention layer
+│   │   ├── ma_core_bridge.py     # PyTorch <-> ma_core C++ engine bridge
+│   │   ├── attention_backends.py # Device dispatch (Metal on MPS, PyTorch elsewhere)
+│   │   ├── mps_attention.py      # Metal kernels for Apple silicon
+│   │   └── blocked_attention.py  # Vectorized PyTorch sparse attention
 │   ├── cuda/                 # C++ CUDA kernel source files
 │   │   ├── sparse_attention_kernel.cu
 │   │   ├── feature_engineering_kernel.cu
@@ -257,6 +260,39 @@ PY
 Notes:
 - Only forward float32 is implemented in CUDA today; training/autograd remains in PyTorch.
 - CPU `ma_core` path (pybind11) is separate and currently CPU-only.
+
+## Apple Silicon (MPS) Kernels
+
+On Apple silicon, sliding-window and financial sparse attention run on Metal kernels in `src/layers/mps_attention.py`, with forward and backward passes for training and inference. They are compiled at runtime through `torch.mps.compile_shader` (PyTorch 2.6 or later), so there is no extra build step. `SparseAttention` and `MACoreAttention` use them automatically for MPS tensors. Other inputs use the vectorized PyTorch implementation in `src/layers/blocked_attention.py`.
+
+```python
+import torch
+from src.layers.attention_backends import financial_attention, sliding_window_attention
+
+q = k = v = torch.randn(1, 16384, 4, 64, device="mps", requires_grad=True)  # [batch, seq, heads, dim]
+out = financial_attention(q, k, v)            # causal local window + dilated clusters
+out = sliding_window_attention(q, k, v, 64)   # |i - j| <= 64
+```
+
+- Head dims that are multiples of 8, up to 128, use tiled kernels built on `simdgroup_matrix`. Other head dims, up to 256, use a simpler per-row kernel.
+- Computation is in float32. Other dtypes are converted and converted back.
+- The first call in a process compiles the kernels, which takes about a second.
+- Set `MA_DISABLE_MPS_KERNELS=1` to fall back to the PyTorch implementation.
+
+Benchmark on your machine, and run the parity tests (MPS cases skip on other hardware):
+
+```
+python scripts/benchmark_mps_attention.py
+pytest tests/integration/test_parity.py -q
+```
+
+Forward + backward on an M1 Pro (14-core GPU), batch 1, 4 heads, head dim 64, float32:
+
+| Pattern | Sequence | PyTorch (vectorized) | Metal (tiled) |
+|---|---|---|---|
+| Sliding window, w=64 | 16,384 | 337 ms | 19 ms |
+| Financial (defaults) | 16,384 | 793 ms | 145 ms |
+| Financial (defaults) | 65,536 | 8,027 ms | 727 ms |
 
 ## Consulting & Production Integration
 
