@@ -106,3 +106,40 @@ def financial_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Ten
         return allowed
 
     return _blocked_attention(query, key, value, key_ranges, mask_fn, block_size)
+
+
+def block_sparse_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                           block_size: int = 64, block: int = DEFAULT_BLOCK_SIZE) -> torch.Tensor:
+    """Query i attends to key j when |i // block_size - j // block_size| <= 1 (ma_core's BLOCK_SPARSE)."""
+    if block_size <= 0:
+        raise ValueError("block_size must be > 0")
+
+    def key_ranges(start, end):
+        return [((start // block_size - 1) * block_size, ((end - 1) // block_size + 2) * block_size)]
+
+    def mask_fn(i, j):
+        return (i // block_size - j // block_size).abs() <= 1
+
+    return _blocked_attention(query, key, value, key_ranges, mask_fn, block)
+
+
+def longformer_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                         window_size: int = 64, num_global_tokens: int = 2,
+                         block: int = DEFAULT_BLOCK_SIZE) -> torch.Tensor:
+    """
+    Query i attends to key j when |i - j| <= window_size or either is one of
+    the first num_global_tokens positions (ma_core's LONGFORMER).
+    """
+    if window_size < 0 or num_global_tokens < 0:
+        raise ValueError("window_size and num_global_tokens must be >= 0")
+    seq_len = query.shape[1]
+
+    def key_ranges(start, end):
+        if start < num_global_tokens:
+            return [(0, seq_len)]
+        return [(0, num_global_tokens), (start - window_size, end + window_size)]
+
+    def mask_fn(i, j):
+        return ((i - j).abs() <= window_size) | (i < num_global_tokens) | (j < num_global_tokens)
+
+    return _blocked_attention(query, key, value, key_ranges, mask_fn, block)

@@ -2,22 +2,28 @@
 """
 Metal (MPS) kernels for sparse attention on Apple silicon.
 
-Patterns are described as "segments": inclusive ranges of key offsets
-relative to the query, so query i attends to key j when j - i falls in any
-segment [lo, hi]. A sliding window is one segment; the financial pattern is a
-causal local window plus one segment per dilated cluster. Offsets covered by
-an earlier segment are skipped, so overlapping segments count each key once.
+Supported patterns (query i, key j):
+  * segments: inclusive ranges of key offsets relative to the query, so i
+    attends to j when j - i falls in any segment [lo, hi]. A sliding window is
+    one segment; the financial pattern is a causal local window plus one
+    segment per dilated cluster. Overlapping segments count each key once.
+  * block-sparse: |i // b - j // b| <= 1 for block size b.
+  * Longformer: |i - j| <= w, or i or j is one of the first g (global) tokens.
 
-Kernels (one SIMD group of 32 threads per row, head_dim split across lanes):
-  * forward: online softmax over the row's keys; also stores the row's
-    log-sum-exp for the backward pass.
-  * backward dQ: one row per query.
-  * backward dK/dV: one row per key, walking the transposed segments, so no
-    atomics are needed and results are deterministic.
+Two kernel families:
+  * Tiled (head_dim a multiple of 8, up to MAX_TILED_HEAD_DIM; all patterns).
+    A threadgroup of 4 SIMD groups owns 32 rows and walks 32-wide tiles of the
+    other side, so each loaded tile is reused by 32 rows. Products use 8x8
+    simdgroup_matrix operations. Forward uses an online softmax and stores each
+    row's log-sum-exp; backward is FlashAttention-2 style (dQ per query block,
+    dK/dV per key block), with no atomics.
+  * Per-row (any head_dim up to MAX_HEAD_DIM; segment patterns only). One SIMD
+    group per row, head_dim split across lanes.
 
-Kernels are compiled at runtime with torch.mps.compile_shader, so no Xcode
-or Objective-C++ build step is required. Inputs are [batch, seq, heads, dim];
-computation is in float32 (other dtypes are converted and converted back).
+Kernels are compiled at runtime with torch.mps.compile_shader, so no Xcode or
+Objective-C++ build step is required. Inputs are [batch, seq, heads, dim] in
+float32, float16 or bfloat16; arithmetic is float32 and results keep the input
+dtype. Other dtypes are converted to float32 and back.
 """
 
 import functools
@@ -33,10 +39,18 @@ _SIMD_WIDTH = 32
 _ROWS_PER_THREADGROUP = 4
 _TILE = 32
 
+# Pattern kinds shared with the Metal source
+KIND_SEGMENTS = 0
+KIND_BLOCK_SPARSE = 1
+KIND_LONGFORMER = 2
+
+_METAL_TYPES = {torch.float32: "float", torch.float16: "half", torch.bfloat16: "bfloat"}
+
 _ROW_SOURCE = r"""
 #include <metal_stdlib>
 using namespace metal;
 
+typedef __T__ T;
 constant int MAX_CHUNKS = 8;          // head_dim <= 8 * 32
 constant float EMPTY_ROW_LSE = -1e30f;
 
@@ -58,10 +72,10 @@ inline void decode_row(long row, long S, long H, thread long& b, thread long& h,
 }
 
 kernel void segment_attention_forward(
-    device const float* Q [[buffer(0)]],
-    device const float* K [[buffer(1)]],
-    device const float* V [[buffer(2)]],
-    device float* O [[buffer(3)]],
+    device const T* Q [[buffer(0)]],
+    device const T* K [[buffer(1)]],
+    device const T* V [[buffer(2)]],
+    device T* O [[buffer(3)]],
     device float* LSE [[buffer(4)]],
     device const int* seg [[buffer(5)]],
     constant long& B [[buffer(6)]],
@@ -80,13 +94,13 @@ kernel void segment_attention_forward(
 
     long stride = H * D;
     long base = b * S * stride + h * D;
-    device const float* q = Q + base + i * stride;
+    device const T* q = Q + base + i * stride;
 
     float qr[MAX_CHUNKS];
     float acc[MAX_CHUNKS];
     for (int c = 0; c < MAX_CHUNKS; ++c) {
         long d = long(lane) + 32 * c;
-        qr[c] = d < D ? q[d] * scale : 0.0f;
+        qr[c] = d < D ? float(q[d]) * scale : 0.0f;
         acc[c] = 0.0f;
     }
 
@@ -97,31 +111,31 @@ kernel void segment_attention_forward(
         long j1 = min(S - 1, i + long(seg[2 * s + 1]));
         for (long j = j0; j <= j1; ++j) {
             if (covered_by_earlier(seg, s, j - i)) continue;
-            device const float* kr = K + base + j * stride;
+            device const T* kr = K + base + j * stride;
             float part = 0.0f;
             for (int c = 0; c < MAX_CHUNKS; ++c) {
                 long d = long(lane) + 32 * c;
-                if (d < D) part += qr[c] * kr[d];
+                if (d < D) part += qr[c] * float(kr[d]);
             }
             float score = simd_sum(part);
             float m_new = l > 0.0f ? max(m, score) : score;
             float correction = l > 0.0f ? exp(m - m_new) : 0.0f;
             float p = exp(score - m_new);
             l = l * correction + p;
-            device const float* vr = V + base + j * stride;
+            device const T* vr = V + base + j * stride;
             for (int c = 0; c < MAX_CHUNKS; ++c) {
                 long d = long(lane) + 32 * c;
-                if (d < D) acc[c] = acc[c] * correction + p * vr[d];
+                if (d < D) acc[c] = acc[c] * correction + p * float(vr[d]);
             }
             m = m_new;
         }
     }
 
     float inv_l = l > 0.0f ? 1.0f / l : 0.0f;
-    device float* o = O + base + i * stride;
+    device T* o = O + base + i * stride;
     for (int c = 0; c < MAX_CHUNKS; ++c) {
         long d = long(lane) + 32 * c;
-        if (d < D) o[d] = acc[c] * inv_l;
+        if (d < D) o[d] = T(acc[c] * inv_l);
     }
     if (lane == 0) {
         LSE[(b * S + i) * H + h] = l > 0.0f ? m + log(l) : EMPTY_ROW_LSE;
@@ -129,13 +143,13 @@ kernel void segment_attention_forward(
 }
 
 kernel void segment_attention_backward_dq(
-    device const float* Q [[buffer(0)]],
-    device const float* K [[buffer(1)]],
-    device const float* V [[buffer(2)]],
-    device const float* dO [[buffer(3)]],
+    device const T* Q [[buffer(0)]],
+    device const T* K [[buffer(1)]],
+    device const T* V [[buffer(2)]],
+    device const T* dO [[buffer(3)]],
     device const float* LSE [[buffer(4)]],
     device const float* Delta [[buffer(5)]],
-    device float* dQ [[buffer(6)]],
+    device T* dQ [[buffer(6)]],
     device const int* seg [[buffer(7)]],
     constant long& B [[buffer(8)]],
     constant long& S [[buffer(9)]],
@@ -160,12 +174,12 @@ kernel void segment_attention_backward_dq(
     float qr[MAX_CHUNKS];
     float gr[MAX_CHUNKS];
     float acc[MAX_CHUNKS];
-    device const float* q = Q + base + i * stride;
-    device const float* g = dO + base + i * stride;
+    device const T* q = Q + base + i * stride;
+    device const T* g = dO + base + i * stride;
     for (int c = 0; c < MAX_CHUNKS; ++c) {
         long d = long(lane) + 32 * c;
-        qr[c] = d < D ? q[d] * scale : 0.0f;
-        gr[c] = d < D ? g[d] : 0.0f;
+        qr[c] = d < D ? float(q[d]) * scale : 0.0f;
+        gr[c] = d < D ? float(g[d]) : 0.0f;
         acc[c] = 0.0f;
     }
 
@@ -175,43 +189,43 @@ kernel void segment_attention_backward_dq(
             long j1 = min(S - 1, i + long(seg[2 * s + 1]));
             for (long j = j0; j <= j1; ++j) {
                 if (covered_by_earlier(seg, s, j - i)) continue;
-                device const float* kr = K + base + j * stride;
-                device const float* vr = V + base + j * stride;
+                device const T* kr = K + base + j * stride;
+                device const T* vr = V + base + j * stride;
                 float qk = 0.0f;
                 float gv = 0.0f;
                 for (int c = 0; c < MAX_CHUNKS; ++c) {
                     long d = long(lane) + 32 * c;
                     if (d < D) {
-                        qk += qr[c] * kr[d];
-                        gv += gr[c] * vr[d];
+                        qk += qr[c] * float(kr[d]);
+                        gv += gr[c] * float(vr[d]);
                     }
                 }
                 float p = exp(simd_sum(qk) - lse);
                 float ds = p * (simd_sum(gv) - delta_i);
                 for (int c = 0; c < MAX_CHUNKS; ++c) {
                     long d = long(lane) + 32 * c;
-                    if (d < D) acc[c] += ds * kr[d];
+                    if (d < D) acc[c] += ds * float(kr[d]);
                 }
             }
         }
     }
 
-    device float* out = dQ + base + i * stride;
+    device T* out = dQ + base + i * stride;
     for (int c = 0; c < MAX_CHUNKS; ++c) {
         long d = long(lane) + 32 * c;
-        if (d < D) out[d] = acc[c] * scale;
+        if (d < D) out[d] = T(acc[c] * scale);
     }
 }
 
 kernel void segment_attention_backward_dkdv(
-    device const float* Q [[buffer(0)]],
-    device const float* K [[buffer(1)]],
-    device const float* V [[buffer(2)]],
-    device const float* dO [[buffer(3)]],
+    device const T* Q [[buffer(0)]],
+    device const T* K [[buffer(1)]],
+    device const T* V [[buffer(2)]],
+    device const T* dO [[buffer(3)]],
     device const float* LSE [[buffer(4)]],
     device const float* Delta [[buffer(5)]],
-    device float* dK [[buffer(6)]],
-    device float* dV [[buffer(7)]],
+    device T* dK [[buffer(6)]],
+    device T* dV [[buffer(7)]],
     device const int* seg [[buffer(8)]],
     constant long& B [[buffer(9)]],
     constant long& S [[buffer(10)]],
@@ -234,12 +248,12 @@ kernel void segment_attention_backward_dkdv(
     float vr[MAX_CHUNKS];
     float dk[MAX_CHUNKS];
     float dv[MAX_CHUNKS];
-    device const float* k = K + base + j * stride;
-    device const float* v = V + base + j * stride;
+    device const T* k = K + base + j * stride;
+    device const T* v = V + base + j * stride;
     for (int c = 0; c < MAX_CHUNKS; ++c) {
         long d = long(lane) + 32 * c;
-        kr[c] = d < D ? k[d] * scale : 0.0f;
-        vr[c] = d < D ? v[d] : 0.0f;
+        kr[c] = d < D ? float(k[d]) * scale : 0.0f;
+        vr[c] = d < D ? float(v[d]) : 0.0f;
         dk[c] = 0.0f;
         dv[c] = 0.0f;
     }
@@ -252,15 +266,15 @@ kernel void segment_attention_backward_dkdv(
         for (long i = i0; i <= i1; ++i) {
             if (covered_by_earlier(seg, s, j - i)) continue;
             long stat = (b * S + i) * H + h;
-            device const float* q = Q + base + i * stride;
-            device const float* g = dO + base + i * stride;
+            device const T* q = Q + base + i * stride;
+            device const T* g = dO + base + i * stride;
             float qk = 0.0f;
             float gv = 0.0f;
             for (int c = 0; c < MAX_CHUNKS; ++c) {
                 long d = long(lane) + 32 * c;
                 if (d < D) {
-                    qk += q[d] * kr[c];
-                    gv += g[d] * vr[c];
+                    qk += float(q[d]) * kr[c];
+                    gv += float(g[d]) * vr[c];
                 }
             }
             float p = exp(simd_sum(qk) - LSE[stat]);
@@ -268,76 +282,213 @@ kernel void segment_attention_backward_dkdv(
             for (int c = 0; c < MAX_CHUNKS; ++c) {
                 long d = long(lane) + 32 * c;
                 if (d < D) {
-                    dv[c] += p * g[d];
-                    dk[c] += ds * q[d];
+                    dv[c] += p * float(g[d]);
+                    dk[c] += ds * float(q[d]);
                 }
             }
         }
     }
 
-    device float* out_k = dK + base + j * stride;
-    device float* out_v = dV + base + j * stride;
+    device T* out_k = dK + base + j * stride;
+    device T* out_v = dV + base + j * stride;
     for (int c = 0; c < MAX_CHUNKS; ++c) {
         long d = long(lane) + 32 * c;
         if (d < D) {
-            out_k[d] = dk[c] * scale;
-            out_v[d] = dv[c];
+            out_k[d] = T(dk[c] * scale);
+            out_v[d] = T(dv[c]);
         }
     }
 }
 """
 
-
-# Tiled kernels (FlashAttention-2 style). A threadgroup of 4 SIMD groups owns a
-# block of 32 rows (8 per SIMD group) and walks 32-wide tiles of the other side,
-# so each loaded key/value tile is reused by 32 queries. Matrix products use
-# 8x8 simdgroup_matrix operations; scores pass through threadgroup memory so the
-# pattern mask and softmax can be applied per element. Sequences are padded to
-# a multiple of 32 by the caller. HEAD_DIM is substituted per compiled library.
 _TILED_SOURCE = r"""
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
 using namespace metal;
 
 #define HEAD_DIM __HEAD_DIM__
+typedef __T__ T;
+typedef simdgroup_matrix<T, 8, 8> simdgroup_T8x8;
+
 constant int DC = HEAD_DIM / 8;      // 8-wide chunks of head_dim
 constant long BLOCK = 32;            // rows per threadgroup, columns per tile
 constant float EMPTY_ROW_LSE = -1e30f;
+constant long KIND_SEGMENTS = 0;
+constant long KIND_BLOCK_SPARSE = 1;
+constant int MAX_FILTERED = 4;       // segments remembered per partial tile
 
-inline bool in_pattern(device const int* seg, long nseg, long delta) {
-    for (long s = 0; s < nseg; ++s) {
-        if (delta >= seg[2 * s] && delta <= seg[2 * s + 1]) return true;
-    }
-    return false;
+// --- Loads and stores: inputs are T in device memory, arithmetic is float ---
+
+inline simdgroup_float8x8 load8(device const T* src, long stride, bool transpose = false) {
+    simdgroup_T8x8 m;
+    simdgroup_load(m, src, stride, ulong2(0, 0), transpose);
+    simdgroup_float8x8 f;
+    f.thread_elements()[0] = float(m.thread_elements()[0]);
+    f.thread_elements()[1] = float(m.thread_elements()[1]);
+    return f;
 }
 
-// Tiles [t0, t1] on the other side reached by segment s from the block of
-// rows starting at r0. Forward and dQ look up keys (offsets lo..hi); dK/dV
-// look up queries, which sit at offsets -hi..-lo from a key.
-inline bool segment_tiles(device const int* seg, long s, long r0, long ntiles, bool transposed,
-                          thread long& t0, thread long& t1) {
-    long lo = transposed ? -long(seg[2 * s + 1]) : long(seg[2 * s]);
-    long hi = transposed ? -long(seg[2 * s]) : long(seg[2 * s + 1]);
-    long first = r0 + lo;
-    long last = r0 + BLOCK - 1 + hi;
+inline simdgroup_float8x8 load8(threadgroup const float* src, long stride, bool transpose = false) {
+    simdgroup_float8x8 f;
+    simdgroup_load(f, src, stride, ulong2(0, 0), transpose);
+    return f;
+}
+
+inline void store8(simdgroup_float8x8 f, device T* dst, long stride) {
+    simdgroup_T8x8 m;
+    m.thread_elements()[0] = T(f.thread_elements()[0]);
+    m.thread_elements()[1] = T(f.thread_elements()[1]);
+    simdgroup_store(m, dst, stride);
+}
+
+// --- Patterns ---------------------------------------------------------------
+// `pat` holds the pattern parameters: (lo, hi) pairs for segments, [b] for
+// block-sparse, [w, g] for Longformer. `np` is the number of segments.
+
+inline long pattern_ranges(long kind, long np) {
+    return kind == KIND_SEGMENTS ? np : (kind == KIND_BLOCK_SPARSE ? 1 : 2);
+}
+
+// Tiles [t0, t1] on the other side reached through range `idx` from the block
+// of BLOCK rows starting at r0. Rows are queries, or keys when `transposed`
+// (dK/dV), in which case segment offsets are negated.
+inline bool pattern_tiles(long kind, device const int* pat, long idx, long r0, long ntiles,
+                          bool transposed, thread long& t0, thread long& t1) {
     long n = ntiles * BLOCK;
+    long first, last;
+    if (kind == KIND_SEGMENTS) {
+        long lo = transposed ? -long(pat[2 * idx + 1]) : long(pat[2 * idx]);
+        long hi = transposed ? -long(pat[2 * idx]) : long(pat[2 * idx + 1]);
+        first = r0 + lo;
+        last = r0 + BLOCK - 1 + hi;
+    } else if (kind == KIND_BLOCK_SPARSE) {
+        long b = pat[0];
+        first = (r0 / b - 1) * b;
+        last = ((r0 + BLOCK - 1) / b + 2) * b - 1;
+    } else {
+        // Longformer is symmetric; global rows reach everything
+        long w = pat[0];
+        long g = pat[1];
+        bool global_rows = r0 < g;
+        if (idx == 0) {
+            if (global_rows) {
+                first = 0;
+                last = n - 1;
+            } else {
+                if (g <= 0) return false;
+                first = 0;
+                last = g - 1;
+            }
+        } else {
+            if (global_rows) return false;
+            first = r0 - w;
+            last = r0 + BLOCK - 1 + w;
+        }
+    }
     if (last < 0 || first > n - 1) return false;
     t0 = max(first, 0L) / BLOCK;
     t1 = min(last, n - 1) / BLOCK;
     return true;
 }
 
-// True if tile t was already visited through an earlier segment, so each
+// True if tile t was already visited through an earlier range, so each
 // (row, column) pair is processed exactly once.
-inline bool tile_seen(device const int* seg, long s, long r0, long ntiles, bool transposed, long t) {
-    for (long m = 0; m < s; ++m) {
+inline bool tile_seen(long kind, device const int* pat, long idx, long r0, long ntiles,
+                      bool transposed, long t) {
+    for (long m = 0; m < idx; ++m) {
         long a, b;
-        if (segment_tiles(seg, m, r0, ntiles, transposed, a, b) && t >= a && t <= b) return true;
+        if (pattern_tiles(kind, pat, m, r0, ntiles, transposed, a, b) && t >= a && t <= b) return true;
     }
     return false;
 }
 
-// Multiply each row of the 8 x HEAD_DIM accumulator by factors[row].
+// Mask for one SIMD group's strip: queries [qa, qb] x keys [ka, kb].
+// `full` means every pair is valid, so the per-element test is skipped;
+// `empty` means none is, so the SIMD group skips the strip. For segments, the
+// few segments overlapping the strip are kept so partial strips test only
+// those (count < 0: too many, test all).
+struct TileMask {
+    bool full;
+    bool empty;
+    int count;
+    int lo[MAX_FILTERED];
+    int hi[MAX_FILTERED];
+};
+
+inline TileMask make_tile_mask(long kind, device const int* pat, long np,
+                               long qa, long qb, long ka, long kb, long S) {
+    TileMask m;
+    m.full = false;
+    m.empty = qa >= S || ka >= S;
+    m.count = 0;
+    if (m.empty) return m;
+    bool in_bounds = qb < S && kb < S;
+    if (kind == KIND_SEGMENTS) {
+        long dmin = ka - qb;
+        long dmax = kb - qa;
+        for (long s = 0; s < np; ++s) {
+            long lo = pat[2 * s];
+            long hi = pat[2 * s + 1];
+            if (hi < dmin || lo > dmax) continue;
+            if (in_bounds && lo <= dmin && dmax <= hi) {
+                m.full = true;
+                return m;
+            }
+            if (m.count >= 0) {
+                if (m.count < MAX_FILTERED) {
+                    m.lo[m.count] = int(lo);
+                    m.hi[m.count] = int(hi);
+                    m.count++;
+                } else {
+                    m.count = -1;
+                }
+            }
+        }
+        m.empty = m.count == 0;
+    } else if (kind == KIND_BLOCK_SPARSE) {
+        long b = pat[0];
+        m.full = in_bounds && max(qb / b - ka / b, kb / b - qa / b) <= 1;
+        m.empty = qa / b - kb / b > 1 || ka / b - qb / b > 1;
+    } else {
+        long w = pat[0];
+        long g = pat[1];
+        m.full = in_bounds && (qb < g || kb < g || max(qb - ka, kb - qa) <= w);
+        m.empty = qa >= g && ka >= g && (qa - kb > w || ka - qb > w);
+    }
+    return m;
+}
+
+inline bool mask_valid(thread const TileMask& m, long kind, device const int* pat, long np,
+                       long i, long j, long S) {
+    if (i >= S || j >= S) return false;
+    if (m.full) return true;
+    if (kind == KIND_SEGMENTS) {
+        long d = j - i;
+        if (m.count >= 0) {
+            for (int s = 0; s < m.count; ++s) {
+                if (d >= m.lo[s] && d <= m.hi[s]) return true;
+            }
+            return false;
+        }
+        for (long s = 0; s < np; ++s) {
+            if (d >= pat[2 * s] && d <= pat[2 * s + 1]) return true;
+        }
+        return false;
+    }
+    if (kind == KIND_BLOCK_SPARSE) {
+        long b = pat[0];
+        long d = i / b - j / b;
+        return d >= -1 && d <= 1;
+    }
+    long w = pat[0];
+    long g = pat[1];
+    return (i - j <= w && j - i <= w) || i < g || j < g;
+}
+
+// --- Strip products ------------------------------------------------------------
+
+// Multiply each row of the 8 x HEAD_DIM accumulator by factors[row], as a
+// product with diag(factors) staged through threadgroup memory.
 inline void scale_rows(thread simdgroup_float8x8* acc, thread const float* factors,
                        threadgroup float* scratch, uint lane) {
     for (uint idx = lane; idx < 64; idx += 32) {
@@ -352,64 +503,66 @@ inline void scale_rows(thread simdgroup_float8x8* acc, thread const float* facto
 }
 
 // strip (8 x 32) = A_rows (8 x HEAD_DIM, in registers) @ X[col0 : col0 + 32]^T
-inline void strip_times_transpose(thread const simdgroup_float8x8* a, device const float* X,
+// X is either device memory (T) or a tile staged in threadgroup memory (float).
+template <typename P>
+inline void strip_times_transpose(thread const simdgroup_float8x8* a, P X,
                                   long col0, long stride, threadgroup float* strip) {
     for (int cb = 0; cb < 4; ++cb) {
         simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-        device const float* x = X + (col0 + 8 * cb) * stride;
+        P x = X + (col0 + 8 * cb) * stride;
         for (int dc = 0; dc < DC; ++dc) {
-            simdgroup_float8x8 xt;
-            simdgroup_load(xt, x + 8 * dc, stride, ulong2(0, 0), true);
-            simdgroup_multiply_accumulate(acc, a[dc], xt, acc);
+            simdgroup_multiply_accumulate(acc, a[dc], load8(x + 8 * dc, stride, true), acc);
         }
         simdgroup_store(acc, strip + 8 * cb, BLOCK);
     }
 }
 
 // Same as above with the 8 x HEAD_DIM left operand held in threadgroup memory
-inline void tg_strip_times_transpose(threadgroup const float* a_rows, device const float* X,
+template <typename P>
+inline void tg_strip_times_transpose(threadgroup const float* a_rows, P X,
                                      long col0, long stride, threadgroup float* strip) {
     for (int cb = 0; cb < 4; ++cb) {
         simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-        device const float* x = X + (col0 + 8 * cb) * stride;
+        P x = X + (col0 + 8 * cb) * stride;
         for (int dc = 0; dc < DC; ++dc) {
-            simdgroup_float8x8 a, xt;
+            simdgroup_float8x8 a;
             simdgroup_load(a, a_rows + 8 * dc, HEAD_DIM);
-            simdgroup_load(xt, x + 8 * dc, stride, ulong2(0, 0), true);
-            simdgroup_multiply_accumulate(acc, a, xt, acc);
+            simdgroup_multiply_accumulate(acc, a, load8(x + 8 * dc, stride, true), acc);
         }
         simdgroup_store(acc, strip + 8 * cb, BLOCK);
     }
 }
 
 // acc (8 x HEAD_DIM) += strip (8 x 32) @ X[row0 : row0 + 32]
+template <typename P>
 inline void accumulate_strip_times(thread simdgroup_float8x8* acc, threadgroup const float* strip,
-                                   device const float* X, long row0, long stride) {
+                                   P X, long row0, long stride) {
     for (int kb = 0; kb < 4; ++kb) {
         simdgroup_float8x8 p;
         simdgroup_load(p, strip + 8 * kb, BLOCK);
-        device const float* x = X + (row0 + 8 * kb) * stride;
+        P x = X + (row0 + 8 * kb) * stride;
         for (int dc = 0; dc < DC; ++dc) {
-            simdgroup_float8x8 xv;
-            simdgroup_load(xv, x + 8 * dc, stride);
-            simdgroup_multiply_accumulate(acc[dc], p, xv, acc[dc]);
+            simdgroup_multiply_accumulate(acc[dc], p, load8(x + 8 * dc, stride), acc[dc]);
         }
     }
 }
 
+// --- Kernels -----------------------------------------------------------------
+
 kernel void tiled_forward(
-    device const float* Q [[buffer(0)]],
-    device const float* K [[buffer(1)]],
-    device const float* V [[buffer(2)]],
-    device float* O [[buffer(3)]],
+    device const T* Q [[buffer(0)]],
+    device const T* K [[buffer(1)]],
+    device const T* V [[buffer(2)]],
+    device T* O [[buffer(3)]],
     device float* LSE [[buffer(4)]],
-    device const int* seg [[buffer(5)]],
-    constant long& B [[buffer(6)]],
-    constant long& S [[buffer(7)]],
-    constant long& S_pad [[buffer(8)]],
-    constant long& H [[buffer(9)]],
-    constant long& nseg [[buffer(10)]],
-    constant float& scale [[buffer(11)]],
+    device const int* pat [[buffer(5)]],
+    constant long& kind [[buffer(6)]],
+    constant long& np [[buffer(7)]],
+    constant long& B [[buffer(8)]],
+    constant long& S [[buffer(9)]],
+    constant long& S_pad [[buffer(10)]],
+    constant long& H [[buffer(11)]],
+    constant float& scale [[buffer(12)]],
     uint tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
@@ -431,18 +584,21 @@ kernel void tiled_forward(
 
     simdgroup_float8x8 q[DC], o[DC];
     for (int dc = 0; dc < DC; ++dc) {
-        simdgroup_load(q[dc], Q + base + r0 * stride + 8 * dc, stride);
+        q[dc] = load8(Q + base + r0 * stride + 8 * dc, stride);
         o[dc] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
     float m[8], l[8], corr[8];
     for (int r = 0; r < 8; ++r) { m[r] = 0.0f; l[r] = 0.0f; }
 
-    for (long s = 0; s < nseg; ++s) {
+    long nranges = pattern_ranges(kind, np);
+    for (long s = 0; s < nranges; ++s) {
         long t0, t1;
-        if (!segment_tiles(seg, s, i0, ntiles, false, t0, t1)) continue;
+        if (!pattern_tiles(kind, pat, s, i0, ntiles, false, t0, t1)) continue;
         for (long t = t0; t <= t1; ++t) {
-            if (tile_seen(seg, s, i0, ntiles, false, t)) continue;
+            if (tile_seen(kind, pat, s, i0, ntiles, false, t)) continue;
             long j0 = t * BLOCK;
+            TileMask tm = make_tile_mask(kind, pat, np, r0, r0 + 7, j0, j0 + BLOCK - 1, S);
+            if (tm.empty) continue;
             strip_times_transpose(q, K + base, j0, stride, strip);
             simdgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -450,7 +606,7 @@ kernel void tiled_forward(
             for (int r = 0; r < 8; ++r) {
                 long i = r0 + r;
                 float score = strip[r * BLOCK + lane] * scale;
-                bool valid = i < S && j < S && in_pattern(seg, nseg, j - i);
+                bool valid = mask_valid(tm, kind, pat, np, i, j, S);
                 if (!simd_any(valid)) {
                     corr[r] = 1.0f;
                     strip[r * BLOCK + lane] = 0.0f;
@@ -473,27 +629,28 @@ kernel void tiled_forward(
 
     for (int r = 0; r < 8; ++r) corr[r] = l[r] > 0.0f ? 1.0f / l[r] : 0.0f;
     scale_rows(o, corr, scratch[sg], lane);
-    for (int dc = 0; dc < DC; ++dc) simdgroup_store(o[dc], O + base + r0 * stride + 8 * dc, stride);
+    for (int dc = 0; dc < DC; ++dc) store8(o[dc], O + base + r0 * stride + 8 * dc, stride);
     if (lane < 8) {
         LSE[(b * S_pad + r0 + lane) * H + h] = l[lane] > 0.0f ? m[lane] + log(l[lane]) : EMPTY_ROW_LSE;
     }
 }
 
 kernel void tiled_backward_dq(
-    device const float* Q [[buffer(0)]],
-    device const float* K [[buffer(1)]],
-    device const float* V [[buffer(2)]],
-    device const float* dO [[buffer(3)]],
+    device const T* Q [[buffer(0)]],
+    device const T* K [[buffer(1)]],
+    device const T* V [[buffer(2)]],
+    device const T* dO [[buffer(3)]],
     device const float* LSE [[buffer(4)]],
     device const float* Delta [[buffer(5)]],
-    device float* dQ [[buffer(6)]],
-    device const int* seg [[buffer(7)]],
-    constant long& B [[buffer(8)]],
-    constant long& S [[buffer(9)]],
-    constant long& S_pad [[buffer(10)]],
-    constant long& H [[buffer(11)]],
-    constant long& nseg [[buffer(12)]],
-    constant float& scale [[buffer(13)]],
+    device T* dQ [[buffer(6)]],
+    device const int* pat [[buffer(7)]],
+    constant long& kind [[buffer(8)]],
+    constant long& np [[buffer(9)]],
+    constant long& B [[buffer(10)]],
+    constant long& S [[buffer(11)]],
+    constant long& S_pad [[buffer(12)]],
+    constant long& H [[buffer(13)]],
+    constant float& scale [[buffer(14)]],
     uint tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
@@ -516,8 +673,8 @@ kernel void tiled_backward_dq(
 
     simdgroup_float8x8 q[DC], g[DC], acc[DC];
     for (int dc = 0; dc < DC; ++dc) {
-        simdgroup_load(q[dc], Q + base + r0 * stride + 8 * dc, stride);
-        simdgroup_load(g[dc], dO + base + r0 * stride + 8 * dc, stride);
+        q[dc] = load8(Q + base + r0 * stride + 8 * dc, stride);
+        g[dc] = load8(dO + base + r0 * stride + 8 * dc, stride);
         acc[dc] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
     float lse[8], delta[8];
@@ -527,12 +684,15 @@ kernel void tiled_backward_dq(
         delta[r] = Delta[stat];
     }
 
-    for (long s = 0; s < nseg; ++s) {
+    long nranges = pattern_ranges(kind, np);
+    for (long s = 0; s < nranges; ++s) {
         long t0, t1;
-        if (!segment_tiles(seg, s, i0, ntiles, false, t0, t1)) continue;
+        if (!pattern_tiles(kind, pat, s, i0, ntiles, false, t0, t1)) continue;
         for (long t = t0; t <= t1; ++t) {
-            if (tile_seen(seg, s, i0, ntiles, false, t)) continue;
+            if (tile_seen(kind, pat, s, i0, ntiles, false, t)) continue;
             long j0 = t * BLOCK;
+            TileMask tm = make_tile_mask(kind, pat, np, r0, r0 + 7, j0, j0 + BLOCK - 1, S);
+            if (tm.empty) continue;
             strip_times_transpose(q, K + base, j0, stride, sS);
             strip_times_transpose(g, V + base, j0, stride, sP);
             simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -540,7 +700,7 @@ kernel void tiled_backward_dq(
             long j = j0 + lane;
             for (int r = 0; r < 8; ++r) {
                 long i = r0 + r;
-                bool valid = i < S && j < S && in_pattern(seg, nseg, j - i);
+                bool valid = mask_valid(tm, kind, pat, np, i, j, S);
                 float p = valid ? exp(sS[r * BLOCK + lane] * scale - lse[r]) : 0.0f;
                 sS[r * BLOCK + lane] = p * (sP[r * BLOCK + lane] - delta[r]) * scale;
             }
@@ -549,25 +709,26 @@ kernel void tiled_backward_dq(
             simdgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
-    for (int dc = 0; dc < DC; ++dc) simdgroup_store(acc[dc], dQ + base + r0 * stride + 8 * dc, stride);
+    for (int dc = 0; dc < DC; ++dc) store8(acc[dc], dQ + base + r0 * stride + 8 * dc, stride);
 }
 
 kernel void tiled_backward_dkdv(
-    device const float* Q [[buffer(0)]],
-    device const float* K [[buffer(1)]],
-    device const float* V [[buffer(2)]],
-    device const float* dO [[buffer(3)]],
+    device const T* Q [[buffer(0)]],
+    device const T* K [[buffer(1)]],
+    device const T* V [[buffer(2)]],
+    device const T* dO [[buffer(3)]],
     device const float* LSE [[buffer(4)]],
     device const float* Delta [[buffer(5)]],
-    device float* dK [[buffer(6)]],
-    device float* dV [[buffer(7)]],
-    device const int* seg [[buffer(8)]],
-    constant long& B [[buffer(9)]],
-    constant long& S [[buffer(10)]],
-    constant long& S_pad [[buffer(11)]],
-    constant long& H [[buffer(12)]],
-    constant long& nseg [[buffer(13)]],
-    constant float& scale [[buffer(14)]],
+    device T* dK [[buffer(6)]],
+    device T* dV [[buffer(7)]],
+    device const int* pat [[buffer(8)]],
+    constant long& kind [[buffer(9)]],
+    constant long& np [[buffer(10)]],
+    constant long& B [[buffer(11)]],
+    constant long& S [[buffer(12)]],
+    constant long& S_pad [[buffer(13)]],
+    constant long& H [[buffer(14)]],
+    constant float& scale [[buffer(15)]],
     uint tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
@@ -600,14 +761,14 @@ kernel void tiled_backward_dkdv(
     threadgroup float* sK = key_rows[sg];
 #else
     simdgroup_float8x8 kk[DC];
-    for (int dc = 0; dc < DC; ++dc) simdgroup_load(kk[dc], K + base + k0 * stride + 8 * dc, stride);
+    for (int dc = 0; dc < DC; ++dc) kk[dc] = load8(K + base + k0 * stride + 8 * dc, stride);
 #endif
     for (uint idx = lane; idx < 8 * HEAD_DIM; idx += 32) {
         long r = idx / HEAD_DIM;
         long d = idx % HEAD_DIM;
-        sV[idx] = V[base + (k0 + r) * stride + d];
+        sV[idx] = float(V[base + (k0 + r) * stride + d]);
 #if HEAD_DIM <= 64
-        sK[idx] = K[base + (k0 + r) * stride + d];
+        sK[idx] = float(K[base + (k0 + r) * stride + d]);
 #endif
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -618,12 +779,15 @@ kernel void tiled_backward_dkdv(
         dv[dc] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
 
-    for (long s = 0; s < nseg; ++s) {
+    long nranges = pattern_ranges(kind, np);
+    for (long s = 0; s < nranges; ++s) {
         long t0, t1;
-        if (!segment_tiles(seg, s, j0b, ntiles, true, t0, t1)) continue;
+        if (!pattern_tiles(kind, pat, s, j0b, ntiles, true, t0, t1)) continue;
         for (long t = t0; t <= t1; ++t) {
-            if (tile_seen(seg, s, j0b, ntiles, true, t)) continue;
+            if (tile_seen(kind, pat, s, j0b, ntiles, true, t)) continue;
             long i0 = t * BLOCK;
+            TileMask tm = make_tile_mask(kind, pat, np, i0, i0 + BLOCK - 1, k0, k0 + 7, S);
+            if (tm.empty) continue;
             // Transposed strips: rows are this SIMD group's 8 keys, columns are 32 queries
 #if HEAD_DIM <= 64
             tg_strip_times_transpose(sK, Q + base, i0, stride, sS);
@@ -639,7 +803,7 @@ kernel void tiled_backward_dkdv(
             float delta = Delta[stat];
             for (int r = 0; r < 8; ++r) {
                 long j = k0 + r;
-                bool valid = i < S && j < S && in_pattern(seg, nseg, j - i);
+                bool valid = mask_valid(tm, kind, pat, np, i, j, S);
                 float p = valid ? exp(sS[r * BLOCK + lane] * scale - lse) : 0.0f;
                 sS[r * BLOCK + lane] = p;
                 sP[r * BLOCK + lane] = p * (sP[r * BLOCK + lane] - delta) * scale;
@@ -651,8 +815,8 @@ kernel void tiled_backward_dkdv(
         }
     }
     for (int dc = 0; dc < DC; ++dc) {
-        simdgroup_store(dk[dc], dK + base + k0 * stride + 8 * dc, stride);
-        simdgroup_store(dv[dc], dV + base + k0 * stride + 8 * dc, stride);
+        store8(dk[dc], dK + base + k0 * stride + 8 * dc, stride);
+        store8(dv[dc], dV + base + k0 * stride + 8 * dc, stride);
     }
 }
 """
@@ -666,29 +830,34 @@ def is_available() -> bool:
 
 
 def supports(query: torch.Tensor) -> bool:
-    """True if the kernels can handle this input (device, rank, head_dim)."""
+    """True if segment patterns (window, financial) can run on this input."""
     return (query.device.type == "mps" and query.dim() == 4
             and 0 < query.shape[-1] <= MAX_HEAD_DIM and is_available())
 
 
-@functools.lru_cache(maxsize=1)
-def _row_library():
-    return torch.mps.compile_shader(_ROW_SOURCE)
-
-
-@functools.lru_cache(maxsize=8)
-def _tiled_library(head_dim: int):
-    return torch.mps.compile_shader(_TILED_SOURCE.replace("__HEAD_DIM__", str(head_dim)))
+def supports_tiled(query: torch.Tensor) -> bool:
+    """True if every pattern, including block-sparse and Longformer, can run on this input."""
+    return supports(query) and _tiled_supported(query.shape[-1])
 
 
 def _tiled_supported(head_dim: int) -> bool:
     return head_dim % 8 == 0 and head_dim <= MAX_TILED_HEAD_DIM
 
 
+@functools.lru_cache(maxsize=4)
+def _row_library(metal_type: str):
+    return torch.mps.compile_shader(_ROW_SOURCE.replace("__T__", metal_type))
+
+
+@functools.lru_cache(maxsize=16)
+def _tiled_library(head_dim: int, metal_type: str):
+    source = _TILED_SOURCE.replace("__HEAD_DIM__", str(head_dim)).replace("__T__", metal_type)
+    return torch.mps.compile_shader(source)
+
+
 @functools.lru_cache(maxsize=64)
-def _segment_tensor(segments: Tuple[Tuple[int, int], ...], device: torch.device) -> torch.Tensor:
-    flat = [offset for segment in segments for offset in segment]
-    return torch.tensor(flat, dtype=torch.int32, device=device)
+def _param_tensor(params: Tuple[int, ...], device: torch.device) -> torch.Tensor:
+    return torch.tensor(params, dtype=torch.int32, device=device)
 
 
 def _row_launch(rows: int):
@@ -708,40 +877,43 @@ def _pad_seq(t: torch.Tensor, padded_len: int) -> torch.Tensor:
     return torch.nn.functional.pad(t, (0, 0, 0, 0, 0, extra)) if extra else t
 
 
-class _SegmentAttention(torch.autograd.Function):
+class _PatternAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, query, key, value, segments, tiled):
+    def forward(ctx, query, key, value, kind, params, num_segments, tiled):
         B, S, H, D = query.shape
-        seg = _segment_tensor(segments, query.device)
+        metal_type = _METAL_TYPES[query.dtype]
+        pat = _param_tensor(params, query.device)
         scale = 1.0 / math.sqrt(D)
-        nseg = len(segments)
         if tiled:
             S_pad = -(-S // _TILE) * _TILE
             q, k, v = (_pad_seq(t.contiguous(), S_pad) for t in (query, key, value))
             out = torch.empty_like(q)
             lse = torch.empty(B, S_pad, H, dtype=torch.float32, device=q.device)
-            _tiled_library(D).tiled_forward(
-                q, k, v, out, lse, seg, B, S, S_pad, H, nseg, scale, **_tiled_launch(B, H, S_pad))
+            _tiled_library(D, metal_type).tiled_forward(
+                q, k, v, out, lse, pat, kind, num_segments, B, S, S_pad, H, scale,
+                **_tiled_launch(B, H, S_pad))
         else:
             q, k, v = (t.contiguous() for t in (query, key, value))
             out = torch.empty_like(q)
             lse = torch.empty(B, S, H, dtype=torch.float32, device=q.device)
-            _row_library().segment_attention_forward(
-                q, k, v, out, lse, seg, B, S, H, D, nseg, scale, **_row_launch(B * H * S))
-        ctx.save_for_backward(q, k, v, out, lse, seg)
+            _row_library(metal_type).segment_attention_forward(
+                q, k, v, out, lse, pat, B, S, H, D, num_segments, scale, **_row_launch(B * H * S))
+        ctx.save_for_backward(q, k, v, out, lse, pat)
         ctx.scale = scale
+        ctx.kind = kind
+        ctx.num_segments = num_segments
         ctx.tiled = tiled
         ctx.seq_len = S
         return out[:, :S]
 
     @staticmethod
     def backward(ctx, grad_out):
-        q, k, v, out, lse, seg = ctx.saved_tensors
+        q, k, v, out, lse, pat = ctx.saved_tensors
         B, S_stored, H, D = q.shape
         S = ctx.seq_len
-        nseg = seg.numel() // 2
-        grad_out = _pad_seq(grad_out.contiguous(), S_stored)
-        delta = (grad_out * out).sum(-1).contiguous()
+        metal_type = _METAL_TYPES[q.dtype]
+        grad_out = _pad_seq(grad_out.to(q.dtype).contiguous(), S_stored)
+        delta = (grad_out.float() * out.float()).sum(-1).contiguous()
         need_q = ctx.needs_input_grad[0]
         need_kv = ctx.needs_input_grad[1] or ctx.needs_input_grad[2]
         grad_q = torch.empty_like(q) if need_q else None
@@ -749,26 +921,47 @@ class _SegmentAttention(torch.autograd.Function):
         grad_v = torch.empty_like(v) if need_kv else None
 
         if ctx.tiled:
-            lib = _tiled_library(D)
+            lib = _tiled_library(D, metal_type)
             launch = _tiled_launch(B, H, S_stored)
+            common = (pat, ctx.kind, ctx.num_segments, B, S, S_stored, H, ctx.scale)
             if need_q:
-                lib.tiled_backward_dq(q, k, v, grad_out, lse, delta, grad_q, seg,
-                                      B, S, S_stored, H, nseg, ctx.scale, **launch)
+                lib.tiled_backward_dq(q, k, v, grad_out, lse, delta, grad_q, *common, **launch)
             if need_kv:
-                lib.tiled_backward_dkdv(q, k, v, grad_out, lse, delta, grad_k, grad_v, seg,
-                                        B, S, S_stored, H, nseg, ctx.scale, **launch)
+                lib.tiled_backward_dkdv(q, k, v, grad_out, lse, delta, grad_k, grad_v, *common, **launch)
         else:
-            lib = _row_library()
+            lib = _row_library(metal_type)
             launch = _row_launch(B * H * S)
+            common = (pat, B, S, H, D, ctx.num_segments, ctx.scale)
             if need_q:
-                lib.segment_attention_backward_dq(
-                    q, k, v, grad_out, lse, delta, grad_q, seg, B, S, H, D, nseg, ctx.scale, **launch)
+                lib.segment_attention_backward_dq(q, k, v, grad_out, lse, delta, grad_q, *common, **launch)
             if need_kv:
-                lib.segment_attention_backward_dkdv(
-                    q, k, v, grad_out, lse, delta, grad_k, grad_v, seg, B, S, H, D, nseg, ctx.scale, **launch)
+                lib.segment_attention_backward_dkdv(q, k, v, grad_out, lse, delta, grad_k, grad_v,
+                                                    *common, **launch)
 
         trim = (lambda g: g[:, :S] if g is not None else None)
-        return trim(grad_q), trim(grad_k), trim(grad_v), None, None
+        return trim(grad_q), trim(grad_k), trim(grad_v), None, None, None, None
+
+
+def _check_inputs(query, key, value, needs_tiled: bool):
+    if not supports(query):
+        raise ValueError("MPS attention needs MPS tensors shaped [batch, seq, heads, dim] "
+                         f"with head_dim <= {MAX_HEAD_DIM}")
+    if needs_tiled and not _tiled_supported(query.shape[-1]):
+        raise ValueError(f"this pattern needs head_dim a multiple of 8 and <= {MAX_TILED_HEAD_DIM}")
+    if key.shape != query.shape or value.shape != query.shape:
+        raise ValueError("query, key and value must have identical shapes")
+    if key.device != query.device or value.device != query.device:
+        raise ValueError("query, key and value must be on the same device")
+
+
+def _apply(query, key, value, kind, params, num_segments, tiled):
+    dtype = query.dtype
+    if dtype not in _METAL_TYPES:
+        query, key, value = query.float(), key.float(), value.float()
+    else:
+        key, value = key.to(dtype), value.to(dtype)
+    out = _PatternAttention.apply(query, key, value, kind, tuple(params), num_segments, tiled)
+    return out.to(dtype)
 
 
 def segment_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
@@ -783,25 +976,13 @@ def segment_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tenso
     """
     if kernel not in ("auto", "tiled", "row"):
         raise ValueError("kernel must be 'auto', 'tiled' or 'row'")
-    if not supports(query):
-        raise ValueError("segment_attention needs MPS tensors shaped [batch, seq, heads, dim] "
-                         f"with head_dim <= {MAX_HEAD_DIM}")
-    if key.shape != query.shape or value.shape != query.shape:
-        raise ValueError("query, key and value must have identical shapes")
-    if key.device != query.device or value.device != query.device:
-        raise ValueError("query, key and value must be on the same device")
+    _check_inputs(query, key, value, needs_tiled=kernel == "tiled")
     segments = tuple((int(lo), int(hi)) for lo, hi in segments)
     if not segments or any(lo > hi for lo, hi in segments):
         raise ValueError("segments must be a non-empty list of (lo, hi) with lo <= hi")
-
-    head_dim = query.shape[-1]
-    if kernel == "tiled" and not _tiled_supported(head_dim):
-        raise ValueError(f"tiled kernel needs head_dim a multiple of 8 and <= {MAX_TILED_HEAD_DIM}")
-    tiled = kernel == "tiled" or (kernel == "auto" and _tiled_supported(head_dim))
-
-    dtype = query.dtype
-    out = _SegmentAttention.apply(query.float(), key.float(), value.float(), segments, tiled)
-    return out.to(dtype)
+    tiled = kernel == "tiled" or (kernel == "auto" and _tiled_supported(query.shape[-1]))
+    params = [offset for segment in segments for offset in segment]
+    return _apply(query, key, value, KIND_SEGMENTS, params, len(segments), tiled)
 
 
 def window_segments(window_size: int, causal: bool = False) -> List[Tuple[int, int]]:
@@ -827,3 +1008,22 @@ def financial_attention(query, key, value, local_window_size: int = 512, dilatio
                         kernel: str = "auto"):
     return segment_attention(query, key, value, financial_segments(
         local_window_size, dilation_stride, dilation_cluster_size, dilation_num_clusters), kernel)
+
+
+def block_sparse_attention(query, key, value, block_size: int = 64):
+    """Query i attends to key j when |i // block_size - j // block_size| <= 1 (tiled kernels only)."""
+    if block_size <= 0:
+        raise ValueError("block_size must be > 0")
+    _check_inputs(query, key, value, needs_tiled=True)
+    return _apply(query, key, value, KIND_BLOCK_SPARSE, [block_size], 0, True)
+
+
+def longformer_attention(query, key, value, window_size: int = 64, num_global_tokens: int = 2):
+    """
+    Query i attends to key j when |i - j| <= window_size or either is one of
+    the first num_global_tokens positions (tiled kernels only).
+    """
+    if window_size < 0 or num_global_tokens < 0:
+        raise ValueError("window_size and num_global_tokens must be >= 0")
+    _check_inputs(query, key, value, needs_tiled=True)
+    return _apply(query, key, value, KIND_LONGFORMER, [window_size, num_global_tokens], 0, True)

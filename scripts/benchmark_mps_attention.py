@@ -5,7 +5,10 @@ Benchmark sparse attention on Apple silicon: vectorized PyTorch vs the Metal
 kernels (per-row and tiled), forward and forward+backward.
 
     python scripts/benchmark_mps_attention.py
-    python scripts/benchmark_mps_attention.py --quick
+    python scripts/benchmark_mps_attention.py --quick --dtype float16
+
+The per-row kernel column is blank for block-sparse and Longformer, which only
+the tiled kernels implement.
 """
 
 import argparse
@@ -24,16 +27,22 @@ CASES = [
     ("window w=16", (4, 4096, 1, 64), "window16"),
     ("window w=64", (1, 16384, 4, 64), "window64"),
     ("financial", (1, 16384, 4, 64), "financial"),
+    ("block b=64", (1, 16384, 4, 64), "block"),
+    ("longformer", (1, 16384, 4, 64), "longformer"),
     ("financial", (1, 65536, 4, 64), "financial"),
 ]
-QUICK_CASES = CASES[:3]
+QUICK_CASES = CASES[:-1]
+DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
+TILED_ONLY = {"block", "longformer"}
 
 
 def run(pattern, impl, q):
-    if impl == "pytorch":
-        module, kwargs = blocked_attention, {}
-    else:
-        module, kwargs = mps_attention, {"kernel": impl}
+    module = blocked_attention if impl == "pytorch" else mps_attention
+    if pattern == "block":
+        return module.block_sparse_attention(q, q, q, 64)
+    if pattern == "longformer":
+        return module.longformer_attention(q, q, q, 64, 2)
+    kwargs = {} if impl == "pytorch" else {"kernel": impl}
     if pattern == "financial":
         return module.financial_attention(q, q, q, **kwargs)
     window = 16 if pattern == "window16" else 64
@@ -54,6 +63,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--quick", action="store_true", help="skip the 64K-token case")
     parser.add_argument("--iterations", type=int, default=3)
+    parser.add_argument("--dtype", choices=DTYPES, default="float32")
     args = parser.parse_args()
 
     if not mps_attention.is_available():
@@ -64,9 +74,12 @@ def main():
     print(header)
     print("-" * len(header))
     for name, shape, pattern in (QUICK_CASES if args.quick else CASES):
-        q = torch.randn(shape, device="mps", requires_grad=True)
+        q = torch.randn(shape, device="mps", dtype=DTYPES[args.dtype], requires_grad=True)
         row = f"{name:12s} {str(shape):20s}"
         for impl in impls:
+            if impl == "row" and pattern in TILED_ONLY:
+                row += f" | {'':>26s}"
+                continue
             forward = time_ms(lambda: run(pattern, impl, q), args.iterations)
             both = time_ms(lambda: run(pattern, impl, q).sum().backward(), args.iterations)
             row += f" | {forward:12.1f} / {both:11.1f}"
