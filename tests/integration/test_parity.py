@@ -449,6 +449,29 @@ def test_layers_dispatch_to_mps_kernels(monkeypatch):
 
 
 @needs_mps_kernels
+def test_mps_tiled_size_limit(monkeypatch):
+    """Inputs too large for 32-bit tiled indexing use the per-row kernels or PyTorch."""
+    q, k, v = random_qkv((1, 70, 2, 16), device="mps")  # pads to 96 rows: 3,072 elements
+    monkeypatch.setattr(mps_attention, "MAX_TILED_ELEMENTS", 3071)
+    assert mps_attention.supports(q) and not mps_attention.supports_tiled(q)
+
+    calls = []
+    original = mps_attention._PatternAttention.apply
+    monkeypatch.setattr(mps_attention._PatternAttention, "apply",
+                        lambda *args: calls.append(args[-1]) or original(*args))
+    out = mps_attention.sliding_window_attention(q, k, v, 4)
+    assert calls == [False], "auto should pick the per-row kernel"
+    assert_close(out, reference_attention(q, k, v, window_pairs(70, 4)), atol=1e-4)
+
+    with pytest.raises(ValueError):
+        mps_attention.sliding_window_attention(q, k, v, 4, kernel="tiled")
+    with pytest.raises(ValueError):
+        mps_attention.block_sparse_attention(q, k, v, 8)
+    assert_close(attention_backends.block_sparse_attention(q, k, v, 8),
+                 reference_attention(q, k, v, block_sparse_pairs(70, 8)), atol=1e-4)
+
+
+@needs_mps_kernels
 def test_mps_kernels_can_be_disabled(monkeypatch):
     monkeypatch.setenv("MA_DISABLE_MPS_KERNELS", "1")
     q, k, v = random_qkv((1, 30, 2, 16), device="mps")
