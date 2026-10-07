@@ -18,6 +18,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 
+from layers import blocked_attention  # noqa: E402
 from layers.blocked_attention import financial_attention, sliding_window_attention  # noqa: E402
 from layers.sparse_attention import SparseAttention  # noqa: E402
 
@@ -172,7 +173,28 @@ def test_financial_attention_matches_reference(device, shape, block_size):
     assert_close(out, reference_attention(q, k, v, financial_pairs(shape[1], **FIN_SMALL)), atol=1e-4)
 
 
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("fn, pairs_fn", [
+    (lambda q, k, v: blocked_attention.block_sparse_attention(q, k, v, block_size=7, block=16),
+     lambda S: block_sparse_pairs(S, 7)),
+    (lambda q, k, v: blocked_attention.block_sparse_attention(q, k, v, block_size=50, block=64),
+     lambda S: block_sparse_pairs(S, 50)),
+    (lambda q, k, v: blocked_attention.longformer_attention(q, k, v, window_size=3, num_global_tokens=2, block=16),
+     lambda S: longformer_pairs(S, 3, 2)),
+    (lambda q, k, v: blocked_attention.longformer_attention(q, k, v, window_size=5, num_global_tokens=40, block=16),
+     lambda S: longformer_pairs(S, 5, 40)),
+])
+def test_block_sparse_and_longformer_match_reference(device, shape, fn, pairs_fn):
+    q, k, v = random_qkv(shape, device=device)
+    assert_close(fn(q, k, v), reference_attention(q, k, v, pairs_fn(shape[1])), atol=1e-4)
+
+
+@pytest.mark.parametrize("fn, pairs_fn", [
+    (lambda q, k, v: blocked_attention.block_sparse_attention(q, k, v, block_size=4, block=5),
+     lambda S: block_sparse_pairs(S, 4)),
+    (lambda q, k, v: blocked_attention.longformer_attention(q, k, v, window_size=2, num_global_tokens=3, block=5),
+     lambda S: longformer_pairs(S, 2, 3)),
     (lambda q, k, v: sliding_window_attention(q, k, v, 3, block_size=5), lambda S: window_pairs(S, 3)),
     (lambda q, k, v: sliding_window_attention(q, k, v, 3, causal=True, block_size=5),
      lambda S: window_pairs(S, 3, causal=True)),
@@ -257,6 +279,33 @@ MPS_CASES = [
     ("window", lambda S: window_pairs(S, 5), lambda: mps_attention.window_segments(5)),
     ("causal", lambda S: window_pairs(S, 7, causal=True), lambda: mps_attention.window_segments(7, causal=True)),
     ("financial", lambda S: financial_pairs(S, **FIN_SMALL), lambda: mps_attention.financial_segments(**FIN_SMALL)),
+    # Strips are 8 x 32 and start at multiples of 8 and 32, so the boundaries
+    # of the empty-strip test need w = 1 (mod 8) and of the full-strip test
+    # need w = 6 (mod 8) with w >= 18; these windows reach both.
+    ("window-w1", lambda S: window_pairs(S, 1), lambda: mps_attention.window_segments(1)),
+    ("window-w9", lambda S: window_pairs(S, 9), lambda: mps_attention.window_segments(9)),
+    ("window-w22", lambda S: window_pairs(S, 22), lambda: mps_attention.window_segments(22)),
+]
+
+# Patterns only the tiled kernels implement: (name, reference pairs, kernel call)
+MPS_TILED_ONLY = [
+    ("block7", lambda S: block_sparse_pairs(S, 7), lambda q, k, v: mps_attention.block_sparse_attention(q, k, v, 7)),
+    ("block50", lambda S: block_sparse_pairs(S, 50), lambda q, k, v: mps_attention.block_sparse_attention(q, k, v, 50)),
+    ("longformer", lambda S: longformer_pairs(S, 3, 2),
+     lambda q, k, v: mps_attention.longformer_attention(q, k, v, 3, 2)),
+    ("longformer-g40", lambda S: longformer_pairs(S, 5, 40),
+     lambda q, k, v: mps_attention.longformer_attention(q, k, v, 5, 40)),
+    ("longformer-g0", lambda S: longformer_pairs(S, 4, 0),
+     lambda q, k, v: mps_attention.longformer_attention(q, k, v, 4, 0)),
+    # Boundary cases for the empty/full strip tests (see MPS_CASES)
+    ("block8", lambda S: block_sparse_pairs(S, 8), lambda q, k, v: mps_attention.block_sparse_attention(q, k, v, 8)),
+    ("block32", lambda S: block_sparse_pairs(S, 32), lambda q, k, v: mps_attention.block_sparse_attention(q, k, v, 32)),
+    ("longformer-w1", lambda S: longformer_pairs(S, 1, 2),
+     lambda q, k, v: mps_attention.longformer_attention(q, k, v, 1, 2)),
+    ("longformer-w9", lambda S: longformer_pairs(S, 9, 2),
+     lambda q, k, v: mps_attention.longformer_attention(q, k, v, 9, 2)),
+    ("longformer-w22", lambda S: longformer_pairs(S, 22, 2),
+     lambda q, k, v: mps_attention.longformer_attention(q, k, v, 22, 2)),
 ]
 # (shape, kernels to test); seq lengths include ones that are not multiples of the 32-row tile
 MPS_SHAPES = [
@@ -293,6 +342,66 @@ def test_mps_kernels_match_reference(shape, kernel, pairs_fn, segments_fn):
         assert_close(actual, wanted, atol=1e-4)
 
 
+def tiled_only_params():
+    for shape, kernels in MPS_SHAPES:
+        if "tiled" in kernels:
+            for name, pairs_fn, call in MPS_TILED_ONLY:
+                yield pytest.param(shape, pairs_fn, call, id=f"{name}-{'x'.join(map(str, shape))}")
+
+
+@needs_mps_kernels
+@pytest.mark.parametrize("shape, pairs_fn, call", list(tiled_only_params()))
+def test_mps_block_sparse_and_longformer_match_reference(shape, pairs_fn, call):
+    q, k, v = (t.requires_grad_() for t in random_qkv(shape, device="mps"))
+    grad_out = torch.randn(shape, generator=torch.Generator().manual_seed(1))
+    out = call(q, k, v)
+    grads = torch.autograd.grad(out, (q, k, v), grad_out.to("mps"))
+
+    rq, rk, rv = (t.detach().cpu().double().requires_grad_() for t in (q, k, v))
+    expected = reference_attention(rq, rk, rv, pairs_fn(shape[1]))
+    expected_grads = torch.autograd.grad(expected, (rq, rk, rv), grad_out.double())
+    assert_close(out, expected.detach(), atol=1e-4)
+    for actual, wanted in zip(grads, expected_grads):
+        assert_close(actual, wanted, atol=1e-4)
+
+
+LOW_PRECISION = [(torch.float16, 3e-3), (torch.bfloat16, 2e-2)]
+
+LOW_PRECISION_CALLS = [
+    ("window-tiled", lambda S: window_pairs(S, 5),
+     lambda q, k, v: mps_attention.sliding_window_attention(q, k, v, 5, kernel="tiled")),
+    ("window-row", lambda S: window_pairs(S, 5),
+     lambda q, k, v: mps_attention.sliding_window_attention(q, k, v, 5, kernel="row")),
+    ("financial", lambda S: financial_pairs(S, **FIN_SMALL),
+     lambda q, k, v: mps_attention.financial_attention(q, k, v, **FIN_SMALL)),
+    ("block", lambda S: block_sparse_pairs(S, 16),
+     lambda q, k, v: mps_attention.block_sparse_attention(q, k, v, 16)),
+    ("longformer", lambda S: longformer_pairs(S, 4, 3),
+     lambda q, k, v: mps_attention.longformer_attention(q, k, v, 4, 3)),
+]
+
+
+@needs_mps_kernels
+@pytest.mark.parametrize("dtype, tol", LOW_PRECISION, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("name, pairs_fn, call", LOW_PRECISION_CALLS, ids=[c[0] for c in LOW_PRECISION_CALLS])
+def test_mps_kernels_native_low_precision(dtype, tol, name, pairs_fn, call):
+    """fp16/bf16 run natively: outputs and gradients keep the dtype and match a
+    reference computed from the same rounded inputs."""
+    shape = (2, 70, 2, 32)
+    q, k, v = (t.to(dtype).requires_grad_() for t in random_qkv(shape, device="mps"))
+    grad_out = torch.randn(shape, generator=torch.Generator().manual_seed(1)).to(dtype)
+    out = call(q, k, v)
+    grads = torch.autograd.grad(out, (q, k, v), grad_out.to("mps"))
+    assert out.dtype == dtype and all(g.dtype == dtype for g in grads)
+
+    rq, rk, rv = (t.detach().cpu().double().requires_grad_() for t in (q, k, v))
+    expected = reference_attention(rq, rk, rv, pairs_fn(shape[1]))
+    expected_grads = torch.autograd.grad(expected, (rq, rk, rv), grad_out.double())
+    for actual, wanted in [(out, expected.detach())] + list(zip(grads, expected_grads)):
+        scale = wanted.abs().max().item()
+        assert_close(actual, wanted, atol=tol * max(scale, 1.0))
+
+
 @needs_mps_kernels
 @pytest.mark.parametrize("kernel", ["tiled", "row"])
 def test_mps_financial_default_config(kernel):
@@ -304,14 +413,6 @@ def test_mps_financial_default_config(kernel):
 
 
 @needs_mps_kernels
-def test_mps_kernels_keep_dtype():
-    q, k, v = random_qkv((1, 40, 2, 16), device="mps")
-    out = mps_attention.sliding_window_attention(q.half(), k.half(), v.half(), 3)
-    assert out.dtype == torch.float16
-    assert_close(out, reference_attention(q, k, v, window_pairs(40, 3)), atol=5e-3)
-
-
-@needs_mps_kernels
 def test_mps_kernels_reject_bad_input():
     q = torch.randn(1, 8, 1, 16, device="mps")
     with pytest.raises(ValueError):
@@ -320,6 +421,12 @@ def test_mps_kernels_reject_bad_input():
         mps_attention.segment_attention(q, q, q, [(2, 1)])
     with pytest.raises(ValueError):
         mps_attention.segment_attention(q[..., :12], q[..., :12], q[..., :12], [(-1, 1)], kernel="tiled")
+    with pytest.raises(ValueError):
+        mps_attention.block_sparse_attention(q[..., :12], q[..., :12], q[..., :12], 4)
+    with pytest.raises(ValueError):
+        mps_attention.block_sparse_attention(q, q, q, 0)
+    with pytest.raises(ValueError):
+        mps_attention.longformer_attention(q, q, q, -1, 2)
 
 
 @needs_mps_kernels
@@ -348,3 +455,15 @@ def test_mps_kernels_can_be_disabled(monkeypatch):
     assert not mps_attention.supports(q)
     out = attention_backends.sliding_window_attention(q, k, v, 4)
     assert_close(out, reference_attention(q, k, v, window_pairs(30, 4)), atol=1e-4)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("head_dim", [16, 20])
+def test_backends_block_sparse_and_longformer(device, head_dim):
+    """Dispatch picks Metal when it can (head_dim 16 on MPS) and PyTorch otherwise."""
+    shape = (1, 50, 2, head_dim)
+    q, k, v = random_qkv(shape, device=device)
+    assert_close(attention_backends.block_sparse_attention(q, k, v, 8),
+                 reference_attention(q, k, v, block_sparse_pairs(50, 8)), atol=1e-4)
+    assert_close(attention_backends.longformer_attention(q, k, v, 3, 2),
+                 reference_attention(q, k, v, longformer_pairs(50, 3, 2)), atol=1e-4)

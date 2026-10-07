@@ -91,12 +91,14 @@ PyTorch's dynamic dispatch and autograd graph add unpredictable latency. Custom 
 * **Comprehensive Profiling:** Integration with NVIDIA Nsight Systems/Compute to demonstrate and analyze performance bottlenecks and optimizations.
 
 
-## Documetn
+## Documentation
 
 For a deeper dive into the theoretical underpinnings and mathematical details of sparse attention mechanisms as applied in this project, please refer to the dedicated whitepaper:
 
 * **[The Theory and Mathematics of Sparse Attention Mechanisms](doc/sparse_attention_whitepaper.md)**
-* **[Latex Source](doc/sparse_attention_whitepaper.tex)**
+* **[LaTeX Source](doc/sparse_attention_whitepaper.tex)**
+
+The LaTeX file is the source of truth. After editing it, regenerate the Markdown copy with `python scripts/whitepaper_to_markdown.py` (requires [pandoc](https://pandoc.org/installing.html)).
 
 
 ## Getting Started
@@ -263,26 +265,28 @@ Notes:
 
 ## Apple Silicon (MPS) Kernels
 
-On Apple silicon, sliding-window and financial sparse attention run on Metal kernels in `src/layers/mps_attention.py`, with forward and backward passes for training and inference. They are compiled at runtime through `torch.mps.compile_shader` (PyTorch 2.6 or later), so there is no extra build step. `SparseAttention` and `MACoreAttention` use them automatically for MPS tensors. Other inputs use the vectorized PyTorch implementation in `src/layers/blocked_attention.py`.
+On Apple silicon, sparse attention runs on Metal kernels in `src/layers/mps_attention.py`, with forward and backward passes for training and inference. They are compiled at runtime through `torch.mps.compile_shader` (PyTorch 2.6 or later), so there is no extra build step. `SparseAttention` and `MACoreAttention` use them automatically for MPS tensors. Other inputs use the vectorized PyTorch implementation in `src/layers/blocked_attention.py`.
 
 ```python
 import torch
-from src.layers.attention_backends import financial_attention, sliding_window_attention
+from src.layers import attention_backends as attn
 
 q = k = v = torch.randn(1, 16384, 4, 64, device="mps", requires_grad=True)  # [batch, seq, heads, dim]
-out = financial_attention(q, k, v)            # causal local window + dilated clusters
-out = sliding_window_attention(q, k, v, 64)   # |i - j| <= 64
+out = attn.sliding_window_attention(q, k, v, 64)     # |i - j| <= 64 (causal=True for j <= i)
+out = attn.financial_attention(q, k, v)              # causal local window + dilated clusters
+out = attn.block_sparse_attention(q, k, v, 64)       # same and neighbouring 64-token blocks
+out = attn.longformer_attention(q, k, v, 64, 2)      # window plus 2 global tokens
 ```
 
-- Head dims that are multiples of 8, up to 128, use tiled kernels built on `simdgroup_matrix`. Other head dims, up to 256, use a simpler per-row kernel.
-- Computation is in float32. Other dtypes are converted and converted back.
-- The first call in a process compiles the kernels, which takes about a second.
-- Set `MA_DISABLE_MPS_KERNELS=1` to fall back to the PyTorch implementation.
+- **Kernels:** head dims that are multiples of 8, up to 128, use tiled kernels built on `simdgroup_matrix`, for every pattern. Other head dims, up to 256, use a simpler per-row kernel for the window and financial patterns. Block-sparse and Longformer with those head dims fall back to PyTorch.
+- **Precision:** float32, float16 and bfloat16 inputs run natively. Arithmetic is float32, and outputs and gradients keep the input dtype. float16 matches float32 speed and halves activation memory. bfloat16 is slower on M1/M2, which lack bfloat16 hardware.
+- **First call:** each process compiles the kernels on first use, which takes about a second.
+- **Off switch:** set `MA_DISABLE_MPS_KERNELS=1` to fall back to the PyTorch implementation.
 
 Benchmark on your machine, and run the parity tests (MPS cases skip on other hardware):
 
 ```
-python scripts/benchmark_mps_attention.py
+python scripts/benchmark_mps_attention.py            # --dtype float16, --quick
 pytest tests/integration/test_parity.py -q
 ```
 
@@ -290,9 +294,11 @@ Forward + backward on an M1 Pro (14-core GPU), batch 1, 4 heads, head dim 64, fl
 
 | Pattern | Sequence | PyTorch (vectorized) | Metal (tiled) |
 |---|---|---|---|
-| Sliding window, w=64 | 16,384 | 337 ms | 19 ms |
-| Financial (defaults) | 16,384 | 793 ms | 145 ms |
-| Financial (defaults) | 65,536 | 8,027 ms | 727 ms |
+| Sliding window, w=64 | 16,384 | 361 ms | 21 ms |
+| Financial (defaults) | 16,384 | 891 ms | 116 ms |
+| Block-sparse, b=64 | 16,384 | 402 ms | 24 ms |
+| Longformer, w=64, 2 global | 16,384 | 365 ms | 43 ms |
+| Financial (defaults) | 65,536 | 13,326 ms | 580 ms |
 
 ## Consulting & Production Integration
 
