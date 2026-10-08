@@ -290,15 +290,21 @@ python scripts/benchmark_mps_attention.py            # --dtype float16, --quick
 pytest tests/integration/test_parity.py -q
 ```
 
-Forward + backward on an M1 Pro (14-core GPU), batch 1, 4 heads, head dim 64, float32:
+Forward + backward on Apple M1 Pro (14-core GPU), batch 1, 4 heads, head dim 64, float32:
 
 | Pattern | Sequence | PyTorch (vectorized) | Metal (tiled) |
 |---|---|---|---|
-| Sliding window, w=64 | 16,384 | 328 ms | 13 ms |
-| Financial (defaults) | 16,384 | 777 ms | 61 ms |
-| Block-sparse, b=64 | 16,384 | 353 ms | 16 ms |
-| Longformer, w=64, 2 global | 16,384 | 401 ms | 30 ms |
-| Financial (defaults) | 65,536 | 5,957 ms | 280 ms |
+| Sliding window, w=64 | 16,384 | 355 ms | 14 ms |
+| Financial (defaults) | 16,384 | 826 ms | 61 ms |
+| Block-sparse, b=64 | 16,384 | 391 ms | 15 ms |
+| Longformer, w=64, 2 global | 16,384 | 396 ms | 32 ms |
+| Financial (defaults) | 65,536 | 6,231 ms | 281 ms |
+
+Times are medians of 5 runs. The Metal column repeats within a few milliseconds; the PyTorch column varies by about 10% between runs. To produce this table on another Mac:
+
+```
+python scripts/benchmark_mps_attention.py --markdown
+```
 
 ### Profiling the kernels
 
