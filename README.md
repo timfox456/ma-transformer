@@ -290,15 +290,15 @@ python scripts/benchmark_mps_attention.py            # --dtype float16, --quick
 pytest tests/integration/test_parity.py -q
 ```
 
-Forward + backward on Apple M1 Pro (14-core GPU) and Apple M6 (12-core GPU), batch 1, 4 heads, head dim 64, float32:
+Forward + backward on Apple M1 Pro (14-core GPU), Apple M4 Pro (20-core GPU) and Apple M6 (12-core GPU), batch 1, 4 heads, head dim 64, float32:
 
-| Pattern | Sequence | M1 Pro PyTorch (vectorized) | M1 Pro Metal (tiled) | M6 PyTorch (vectorized) | M6 Metal (tiled) |
-|---|---|---|---|---|---|
-| Sliding window, w=64 | 16,384 | 355 ms | 14 ms | 282 ms | 6 ms |
-| Financial (defaults) | 16,384 | 826 ms | 61 ms | 527 ms | 22 ms |
-| Block-sparse, b=64 | 16,384 | 391 ms | 15 ms | 281 ms | 7 ms |
-| Longformer, w=64, 2 global | 16,384 | 396 ms | 32 ms | 303 ms | 13 ms |
-| Financial (defaults) | 65,536 | 6,231 ms | 281 ms | 4,863 ms | 98 ms |
+| Pattern | Sequence | M1 Pro PyTorch (vectorized) | M1 Pro Metal (tiled) | M4 Pro PyTorch (vectorized) | M4 Pro Metal (tiled) | M6 PyTorch (vectorized) | M6 Metal (tiled) |
+|---|---|---|---|---|---|---|---|
+| Sliding window, w=64 | 16,384 | 355 ms | 14 ms | 179 ms | 5 ms | 282 ms | 6 ms |
+| Financial (defaults) | 16,384 | 826 ms | 61 ms | 416 ms | 18 ms | 527 ms | 22 ms |
+| Block-sparse, b=64 | 16,384 | 391 ms | 15 ms | 182 ms | 5 ms | 281 ms | 7 ms |
+| Longformer, w=64, 2 global | 16,384 | 396 ms | 32 ms | 193 ms | 14 ms | 303 ms | 13 ms |
+| Financial (defaults) | 65,536 | 6,231 ms | 281 ms | 3,217 ms | 79 ms | 4,863 ms | 98 ms |
 
 Times are medians of 5 runs. The Metal columns repeat within a few milliseconds; the PyTorch columns vary by about 10% between runs. To produce these columns on another Mac:
 
