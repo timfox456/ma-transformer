@@ -319,7 +319,6 @@ constant int BLOCK = 32;            // rows per threadgroup, columns per tile
 constant float EMPTY_ROW_LSE = -1e30f;
 constant int KIND_SEGMENTS = 0;
 constant int KIND_BLOCK_SPARSE = 1;
-constant int MAX_FILTERED = 4;       // segments remembered per partial tile
 
 // --- Loads and stores: inputs are T in device memory, arithmetic is float ---
 
@@ -408,15 +407,16 @@ inline bool tile_seen(int kind, device const int* pat, int idx, int r0, int ntil
 
 // Mask for one SIMD group's strip: queries [qa, qb] x keys [ka, kb].
 // `full` means every pair is valid, so the per-element test is skipped;
-// `empty` means none is, so the SIMD group skips the strip. For segments, the
-// few segments overlapping the strip are kept so partial strips test only
-// those (count < 0: too many, test all).
+// `empty` means none is, so the SIMD group skips the strip. For segments, up
+// to two segments overlapping the strip are kept so partial strips test only
+// those (count < 0: more overlap, test all). They are separate scalars, not an
+// array: an array written at a runtime index cannot live in registers, and
+// spilling it to memory slowed every kernel.
 struct TileMask {
     bool full;
     bool empty;
     int count;
-    int lo[MAX_FILTERED];
-    int hi[MAX_FILTERED];
+    int lo0, hi0, lo1, hi1;
 };
 
 inline TileMask make_tile_mask(int kind, device const int* pat, int np,
@@ -438,14 +438,16 @@ inline TileMask make_tile_mask(int kind, device const int* pat, int np,
                 m.full = true;
                 return m;
             }
-            if (m.count >= 0) {
-                if (m.count < MAX_FILTERED) {
-                    m.lo[m.count] = int(lo);
-                    m.hi[m.count] = int(hi);
-                    m.count++;
-                } else {
-                    m.count = -1;
-                }
+            if (m.count == 0) {
+                m.lo0 = lo;
+                m.hi0 = hi;
+                m.count = 1;
+            } else if (m.count == 1) {
+                m.lo1 = lo;
+                m.hi1 = hi;
+                m.count = 2;
+            } else {
+                m.count = -1;
             }
         }
         m.empty = m.count == 0;
@@ -469,10 +471,8 @@ inline bool mask_valid(thread const TileMask& m, int kind, device const int* pat
     if (kind == KIND_SEGMENTS) {
         int d = j - i;
         if (m.count >= 0) {
-            for (int s = 0; s < m.count; ++s) {
-                if (d >= m.lo[s] && d <= m.hi[s]) return true;
-            }
-            return false;
+            return (m.count >= 1 && d >= m.lo0 && d <= m.hi0) ||
+                   (m.count == 2 && d >= m.lo1 && d <= m.hi1);
         }
         for (int s = 0; s < np; ++s) {
             if (d >= pat[2 * s] && d <= pat[2 * s + 1]) return true;
@@ -491,18 +491,12 @@ inline bool mask_valid(thread const TileMask& m, int kind, device const int* pat
 
 // --- Strip products ------------------------------------------------------------
 
-// Multiply each row of the 8 x HEAD_DIM accumulator by factors[row], as a
-// product with diag(factors) staged through threadgroup memory.
-inline void scale_rows(thread simdgroup_float8x8* acc, thread const float* factors,
-                       threadgroup float* scratch, uint lane) {
-    for (uint idx = lane; idx < 64; idx += 32) {
-        uint r = idx / 8;
-        scratch[idx] = (r == idx % 8) ? factors[r] : 0.0f;
-    }
+// acc = diag @ acc, with the 8x8 diagonal already written to threadgroup memory
+inline void scale_by_diag(thread simdgroup_float8x8* acc, threadgroup const float* diag) {
     simdgroup_barrier(mem_flags::mem_threadgroup);
-    simdgroup_float8x8 diag;
-    simdgroup_load(diag, scratch, 8);
-    for (int dc = 0; dc < DC; ++dc) simdgroup_multiply(acc[dc], diag, acc[dc]);
+    simdgroup_float8x8 d;
+    simdgroup_load(d, diag, 8);
+    for (int dc = 0; dc < DC; ++dc) simdgroup_multiply(acc[dc], d, acc[dc]);
     simdgroup_barrier(mem_flags::mem_threadgroup);
 }
 
@@ -597,8 +591,12 @@ kernel void tiled_forward(
         q[dc] = load8(Q + base + r0 * stride + 8 * dc, stride);
         o[dc] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
-    float m[8], l[8], corr[8];
-    for (int r = 0; r < 8; ++r) { m[r] = 0.0f; l[r] = 0.0f; }
+    // Lane r (< 8) holds the running max and sum of row r; the rescale
+    // factors go straight onto the diagonal of an 8x8 scratch matrix.
+    float row_m = 0.0f;
+    float row_l = 0.0f;
+    threadgroup float* diag = scratch[sg];
+    for (uint idx = lane; idx < 64; idx += 32) diag[idx] = 0.0f;
 
     int nranges = pattern_ranges(kind, np);
     for (int s = 0; s < nranges; ++s) {
@@ -618,30 +616,35 @@ kernel void tiled_forward(
                 float score = strip[r * BLOCK + lane] * scale;
                 bool valid = mask_valid(tm, kind, pat, np, i, j, S);
                 if (!simd_any(valid)) {
-                    corr[r] = 1.0f;
+                    if (lane == 0) diag[r * 9] = 1.0f;
                     strip[r * BLOCK + lane] = 0.0f;
                     continue;
                 }
+                float m_r = simd_shuffle(row_m, ushort(r));
+                float l_r = simd_shuffle(row_l, ushort(r));
                 float tile_max = simd_max(valid ? score : -FLT_MAX);
-                float m_new = l[r] > 0.0f ? max(m[r], tile_max) : tile_max;
-                float c = l[r] > 0.0f ? exp(m[r] - m_new) : 0.0f;
+                float m_new = l_r > 0.0f ? max(m_r, tile_max) : tile_max;
+                float c = l_r > 0.0f ? exp(m_r - m_new) : 0.0f;
                 float p = valid ? exp(score - m_new) : 0.0f;
-                l[r] = l[r] * c + simd_sum(p);
-                m[r] = m_new;
-                corr[r] = c;
+                float l_new = l_r * c + simd_sum(p);
+                if (lane == uint(r)) {
+                    row_m = m_new;
+                    row_l = l_new;
+                }
+                if (lane == 0) diag[r * 9] = c;
                 strip[r * BLOCK + lane] = p;
             }
-            scale_rows(o, corr, scratch[sg], lane);
+            scale_by_diag(o, diag);
             accumulate_strip_times(o, strip, V + base, j0, stride);
             simdgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
 
-    for (int r = 0; r < 8; ++r) corr[r] = l[r] > 0.0f ? 1.0f / l[r] : 0.0f;
-    scale_rows(o, corr, scratch[sg], lane);
+    if (lane < 8) diag[lane * 9] = row_l > 0.0f ? 1.0f / row_l : 0.0f;
+    scale_by_diag(o, diag);
     for (int dc = 0; dc < DC; ++dc) store8(o[dc], O + base + r0 * stride + 8 * dc, stride);
     if (lane < 8) {
-        LSE[(b * S_pad + r0 + lane) * H + h] = l[lane] > 0.0f ? m[lane] + log(l[lane]) : EMPTY_ROW_LSE;
+        LSE[(b * S_pad + r0 + lane) * H + h] = row_l > 0.0f ? row_m + log(row_l) : EMPTY_ROW_LSE;
     }
 }
 
@@ -693,12 +696,10 @@ kernel void tiled_backward_dq(
         g[dc] = load8(dO + base + r0 * stride + 8 * dc, stride);
         acc[dc] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
-    float lse[8], delta[8];
-    for (int r = 0; r < 8; ++r) {
-        int stat = (b * S_pad + r0 + r) * H + h;
-        lse[r] = LSE[stat];
-        delta[r] = Delta[stat];
-    }
+    // Lane r (< 8) holds the log-sum-exp and delta of row r
+    int own_stat = (b * S_pad + r0 + min(lane, 7u)) * H + h;
+    float row_lse = LSE[own_stat];
+    float row_delta = Delta[own_stat];
 
     int nranges = pattern_ranges(kind, np);
     for (int s = 0; s < nranges; ++s) {
@@ -717,8 +718,10 @@ kernel void tiled_backward_dq(
             for (int r = 0; r < 8; ++r) {
                 int i = r0 + r;
                 bool valid = mask_valid(tm, kind, pat, np, i, j, S);
-                float p = valid ? exp(sS[r * BLOCK + lane] * scale - lse[r]) : 0.0f;
-                sS[r * BLOCK + lane] = p * (sP[r * BLOCK + lane] - delta[r]) * scale;
+                float lse = simd_shuffle(row_lse, ushort(r));
+                float delta = simd_shuffle(row_delta, ushort(r));
+                float p = valid ? exp(sS[r * BLOCK + lane] * scale - lse) : 0.0f;
+                sS[r * BLOCK + lane] = p * (sP[r * BLOCK + lane] - delta) * scale;
             }
             simdgroup_barrier(mem_flags::mem_threadgroup);
             accumulate_strip_times(acc, sS, K + base, j0, stride);
@@ -757,12 +760,10 @@ kernel void tiled_backward_dkdv(
     const int H = int(H_arg);
     threadgroup float prob_strips[4][8 * BLOCK];
     threadgroup float grad_strips[4][8 * BLOCK];
-    // K and V rows live in threadgroup memory rather than registers: holding
-    // them alongside the dK and dV accumulators spills registers. Above
-    // head_dim 64 both would exceed 32 KB, so K stays in registers.
-#if HEAD_DIM <= 64
-    threadgroup float key_rows[4][8 * HEAD_DIM];
-#endif
+    // V rows are staged in threadgroup memory and K rows stay in registers.
+    // Staging K as well needs 24 KB, which leaves room for only one
+    // threadgroup per core; keeping V in registers too raises register use
+    // more than it saves (both measured slower on M1 Pro).
     threadgroup float value_rows[4][8 * HEAD_DIM];
     int ntiles = S_pad / BLOCK;
     int blk = tg % ntiles;
@@ -779,19 +780,12 @@ kernel void tiled_backward_dkdv(
     threadgroup float* sP = grad_strips[sg];
 
     threadgroup float* sV = value_rows[sg];
-#if HEAD_DIM <= 64
-    threadgroup float* sK = key_rows[sg];
-#else
     simdgroup_float8x8 kk[DC];
     for (int dc = 0; dc < DC; ++dc) kk[dc] = load8(K + base + k0 * stride + 8 * dc, stride);
-#endif
     for (uint idx = lane; idx < 8 * HEAD_DIM; idx += 32) {
         int r = idx / HEAD_DIM;
         int d = idx % HEAD_DIM;
         sV[idx] = float(V[base + (k0 + r) * stride + d]);
-#if HEAD_DIM <= 64
-        sK[idx] = float(K[base + (k0 + r) * stride + d]);
-#endif
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -811,11 +805,7 @@ kernel void tiled_backward_dkdv(
             TileMask tm = make_tile_mask(kind, pat, np, i0, i0 + BLOCK - 1, k0, k0 + 7, S);
             if (tm.empty) continue;
             // Transposed strips: rows are this SIMD group's 8 keys, columns are 32 queries
-#if HEAD_DIM <= 64
-            tg_strip_times_transpose(sK, Q + base, i0, stride, sS);
-#else
             strip_times_transpose(kk, Q + base, i0, stride, sS);
-#endif
             tg_strip_times_transpose(sV, dO + base, i0, stride, sP);
             simdgroup_barrier(mem_flags::mem_threadgroup);
 
