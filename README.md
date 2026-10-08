@@ -294,11 +294,20 @@ Forward + backward on an M1 Pro (14-core GPU), batch 1, 4 heads, head dim 64, fl
 
 | Pattern | Sequence | PyTorch (vectorized) | Metal (tiled) |
 |---|---|---|---|
-| Sliding window, w=64 | 16,384 | 361 ms | 21 ms |
-| Financial (defaults) | 16,384 | 891 ms | 116 ms |
-| Block-sparse, b=64 | 16,384 | 402 ms | 24 ms |
-| Longformer, w=64, 2 global | 16,384 | 365 ms | 43 ms |
-| Financial (defaults) | 65,536 | 13,326 ms | 580 ms |
+| Sliding window, w=64 | 16,384 | 385 ms | 19 ms |
+| Financial (defaults) | 16,384 | 792 ms | 90 ms |
+| Block-sparse, b=64 | 16,384 | 385 ms | 18 ms |
+| Longformer, w=64, 2 global | 16,384 | 426 ms | 37 ms |
+| Financial (defaults) | 65,536 | 7,812 ms | 423 ms |
+
+### Profiling the kernels
+
+With Xcode installed and its license accepted, `scripts/profile_mps_kernels.py` records an Instruments Metal System Trace with GPU counters and prints, for the forward, dQ and dK/dV kernels: GPU time per call, the pipeline's register-limited thread count, threadgroup memory, register spills, and Apple's performance-limiter counters (occupancy, ALU, buffer reads, last-level cache, bandwidth). The trace is kept for opening in Instruments.
+
+```
+python scripts/profile_mps_kernels.py                          # financial, 16K tokens
+python scripts/profile_mps_kernels.py --pattern window --dtype float16 --out profile/
+```
 
 ## Consulting & Production Integration
 
