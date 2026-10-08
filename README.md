@@ -294,11 +294,11 @@ Forward + backward on an M1 Pro (14-core GPU), batch 1, 4 heads, head dim 64, fl
 
 | Pattern | Sequence | PyTorch (vectorized) | Metal (tiled) |
 |---|---|---|---|
-| Sliding window, w=64 | 16,384 | 385 ms | 19 ms |
-| Financial (defaults) | 16,384 | 792 ms | 90 ms |
-| Block-sparse, b=64 | 16,384 | 385 ms | 18 ms |
-| Longformer, w=64, 2 global | 16,384 | 426 ms | 37 ms |
-| Financial (defaults) | 65,536 | 7,812 ms | 423 ms |
+| Sliding window, w=64 | 16,384 | 328 ms | 13 ms |
+| Financial (defaults) | 16,384 | 777 ms | 61 ms |
+| Block-sparse, b=64 | 16,384 | 353 ms | 16 ms |
+| Longformer, w=64, 2 global | 16,384 | 401 ms | 30 ms |
+| Financial (defaults) | 65,536 | 5,957 ms | 280 ms |
 
 ### Profiling the kernels
 
