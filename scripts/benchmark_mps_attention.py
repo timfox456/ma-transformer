@@ -8,7 +8,9 @@ kernels (per-row and tiled), forward and forward+backward.
     python scripts/benchmark_mps_attention.py --quick --dtype float16
     python scripts/benchmark_mps_attention.py --markdown   # README table for this Mac
 
-Times are the median of --iterations runs after one warm-up call.
+Times are the median of --iterations runs after one warm-up call. Before
+printing the README table, --markdown checks the Metal kernels against the
+PyTorch implementation on this GPU and refuses to print if they disagree.
 
 The per-row kernel column is blank for block-sparse and Longformer, which only
 the tiled kernels implement.
@@ -86,15 +88,62 @@ MARKDOWN_ROWS = [
 ]
 
 
+def format_ms(ms):
+    """Whole milliseconds, with one decimal below 10 ms where rounding would hide differences."""
+    return f"{ms:.1f} ms" if ms < 10 else f"{ms:,.0f} ms"
+
+
+# Relative tolerance for the pre-benchmark check, by dtype (low precision rounds outputs)
+CHECK_TOLERANCE = {"float32": 1e-4, "float16": 5e-3, "bfloat16": 3e-2}
+
+
+def verify_kernels(args):
+    """
+    Compare the Metal kernels with the PyTorch implementation (forward and
+    gradients) for every pattern in the table, at a size where the financial
+    clusters are reached. Returns a list of failures, empty if all agree.
+    """
+    torch.manual_seed(0)
+    dtype = DTYPES[args.dtype]
+    shape = (1, 2100, 2, 64)
+    failures = []
+    for pattern in ("window64", "financial", "block", "longformer"):
+        q, k, v = (torch.randn(shape, device="mps", dtype=dtype, requires_grad=True) for _ in range(3))
+        grad_out = torch.randn(shape, device="mps", dtype=dtype)
+        results = {}
+        for impl in ("tiled", "pytorch"):
+            inputs = [t if impl == "tiled" else t.detach().float().requires_grad_() for t in (q, k, v)]
+            module = mps_attention if impl == "tiled" else blocked_attention
+            if pattern == "block":
+                out = module.block_sparse_attention(*inputs, 64)
+            elif pattern == "longformer":
+                out = module.longformer_attention(*inputs, 64, 2)
+            elif pattern == "financial":
+                out = module.financial_attention(*inputs)
+            else:
+                out = module.sliding_window_attention(*inputs, 64)
+            grads = torch.autograd.grad(out, inputs, grad_out.to(out.dtype))
+            results[impl] = [t.detach().float() for t in (out, *grads)]
+        for name, got, want in zip(("output", "dQ", "dK", "dV"), results["tiled"], results["pytorch"]):
+            err = (got - want).abs().max().item() / max(want.abs().max().item(), 1.0)
+            if not err <= CHECK_TOLERANCE[args.dtype]:
+                failures.append(f"{pattern} {name}: relative error {err:.2e}")
+    return failures
+
+
 def markdown_table(args):
     """Forward + backward times as the README's Markdown table."""
+    failures = verify_kernels(args)
+    if failures:
+        sys.exit("Metal kernels disagree with the PyTorch implementation on this GPU; "
+                 "not printing benchmark numbers:\n  " + "\n  ".join(failures))
     lines = [f"Forward + backward on {machine_name()}, batch 1, 4 heads, head dim 64, {args.dtype}:", "",
              "| Pattern | Sequence | PyTorch (vectorized) | Metal (tiled) |", "|---|---|---|---|"]
     for label, index in MARKDOWN_ROWS:
         _, shape, pattern = CASES[index]
         q = torch.randn(shape, device="mps", dtype=DTYPES[args.dtype], requires_grad=True)
         cells = [time_ms(lambda: run(pattern, impl, q).sum().backward(), args.iterations) for impl in ("pytorch", "tiled")]
-        lines.append(f"| {label} | {shape[1]:,} | " + " | ".join(f"{ms:,.0f} ms" for ms in cells) + " |")
+        lines.append(f"| {label} | {shape[1]:,} | " + " | ".join(format_ms(ms) for ms in cells) + " |")
     print("\n".join(lines))
 
 

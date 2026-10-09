@@ -300,7 +300,7 @@ Forward + backward on Apple M1 Pro (14-core GPU), Apple M4 Pro (20-core GPU) and
 | Longformer, w=64, 2 global | 16,384 | 396 ms | 32 ms | 193 ms | 14 ms | 303 ms | 13 ms |
 | Financial (defaults) | 65,536 | 6,231 ms | 281 ms | 3,217 ms | 79 ms | 4,863 ms | 98 ms |
 
-Times are medians of 5 runs. The Metal columns repeat within a few milliseconds; the PyTorch columns vary by about 10% between runs. To produce these columns on another Mac:
+Times are medians of 5 runs. The Metal columns repeat within a few milliseconds; the PyTorch columns vary by 10–20% between runs. Before printing, `--markdown` checks the Metal kernels against the PyTorch implementation on that GPU (forward and gradients, every pattern) and refuses to print if they disagree. To produce these columns on another Mac:
 
 ```
 python scripts/benchmark_mps_attention.py --markdown
