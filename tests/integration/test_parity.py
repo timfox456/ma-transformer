@@ -274,6 +274,8 @@ def test_sparse_attention_backends_agree(training):
 from layers import attention_backends, mps_attention  # noqa: E402
 
 needs_mps_kernels = pytest.mark.skipif(not mps_attention.is_available(), reason="MPS kernels unavailable")
+MPP = mps_attention.is_available() and mps_attention.mpp_available()
+needs_mpp = pytest.mark.skipif(not MPP, reason="MPP kernels need Metal 4 support in PyTorch (2.14 or later)")
 
 MPS_CASES = [
     ("window", lambda S: window_pairs(S, 5), lambda: mps_attention.window_segments(5)),
@@ -289,30 +291,33 @@ MPS_CASES = [
 
 # Patterns only the tiled kernels implement: (name, reference pairs, kernel call)
 MPS_TILED_ONLY = [
-    ("block7", lambda S: block_sparse_pairs(S, 7), lambda q, k, v: mps_attention.block_sparse_attention(q, k, v, 7)),
-    ("block50", lambda S: block_sparse_pairs(S, 50), lambda q, k, v: mps_attention.block_sparse_attention(q, k, v, 50)),
+    ("block7", lambda S: block_sparse_pairs(S, 7), lambda q, k, v, kernel: mps_attention.block_sparse_attention(q, k, v, 7, kernel=kernel)),
+    ("block50", lambda S: block_sparse_pairs(S, 50), lambda q, k, v, kernel: mps_attention.block_sparse_attention(q, k, v, 50, kernel=kernel)),
     ("longformer", lambda S: longformer_pairs(S, 3, 2),
-     lambda q, k, v: mps_attention.longformer_attention(q, k, v, 3, 2)),
+     lambda q, k, v, kernel: mps_attention.longformer_attention(q, k, v, 3, 2, kernel=kernel)),
     ("longformer-g40", lambda S: longformer_pairs(S, 5, 40),
-     lambda q, k, v: mps_attention.longformer_attention(q, k, v, 5, 40)),
+     lambda q, k, v, kernel: mps_attention.longformer_attention(q, k, v, 5, 40, kernel=kernel)),
     ("longformer-g0", lambda S: longformer_pairs(S, 4, 0),
-     lambda q, k, v: mps_attention.longformer_attention(q, k, v, 4, 0)),
+     lambda q, k, v, kernel: mps_attention.longformer_attention(q, k, v, 4, 0, kernel=kernel)),
     # Boundary cases for the empty/full strip tests (see MPS_CASES)
-    ("block8", lambda S: block_sparse_pairs(S, 8), lambda q, k, v: mps_attention.block_sparse_attention(q, k, v, 8)),
-    ("block32", lambda S: block_sparse_pairs(S, 32), lambda q, k, v: mps_attention.block_sparse_attention(q, k, v, 32)),
+    ("block8", lambda S: block_sparse_pairs(S, 8), lambda q, k, v, kernel: mps_attention.block_sparse_attention(q, k, v, 8, kernel=kernel)),
+    ("block32", lambda S: block_sparse_pairs(S, 32), lambda q, k, v, kernel: mps_attention.block_sparse_attention(q, k, v, 32, kernel=kernel)),
     ("longformer-w1", lambda S: longformer_pairs(S, 1, 2),
-     lambda q, k, v: mps_attention.longformer_attention(q, k, v, 1, 2)),
+     lambda q, k, v, kernel: mps_attention.longformer_attention(q, k, v, 1, 2, kernel=kernel)),
     ("longformer-w9", lambda S: longformer_pairs(S, 9, 2),
-     lambda q, k, v: mps_attention.longformer_attention(q, k, v, 9, 2)),
+     lambda q, k, v, kernel: mps_attention.longformer_attention(q, k, v, 9, 2, kernel=kernel)),
     ("longformer-w22", lambda S: longformer_pairs(S, 22, 2),
-     lambda q, k, v: mps_attention.longformer_attention(q, k, v, 22, 2)),
+     lambda q, k, v, kernel: mps_attention.longformer_attention(q, k, v, 22, 2, kernel=kernel)),
 ]
 # (shape, kernels to test); seq lengths include ones that are not multiples of the 32-row tile
+# MPP cases are included only when the MPP kernels compile here (PyTorch 2.14+)
+_MPP = ("mpp",) if MPP else ()
 MPS_SHAPES = [
     ((1, 1, 1, 8), ("tiled", "row")),
     ((2, 17, 3, 16), ("tiled", "row")),
-    ((2, 300, 2, 64), ("tiled", "row")),
-    ((1, 70, 2, 128), ("tiled", "row")),
+    ((1, 40, 1, 32), ("tiled", "row") + _MPP),
+    ((2, 300, 2, 64), ("tiled", "row") + _MPP),
+    ((1, 70, 2, 128), ("tiled", "row") + _MPP),
     ((1, 45, 2, 20), ("row",)),
     ((1, 33, 1, 256), ("row",)),
 ]
@@ -344,17 +349,19 @@ def test_mps_kernels_match_reference(shape, kernel, pairs_fn, segments_fn):
 
 def tiled_only_params():
     for shape, kernels in MPS_SHAPES:
-        if "tiled" in kernels:
+        for kernel in kernels:
+            if kernel == "row":
+                continue
             for name, pairs_fn, call in MPS_TILED_ONLY:
-                yield pytest.param(shape, pairs_fn, call, id=f"{name}-{'x'.join(map(str, shape))}")
+                yield pytest.param(shape, kernel, pairs_fn, call, id=f"{name}-{kernel}-{'x'.join(map(str, shape))}")
 
 
 @needs_mps_kernels
-@pytest.mark.parametrize("shape, pairs_fn, call", list(tiled_only_params()))
-def test_mps_block_sparse_and_longformer_match_reference(shape, pairs_fn, call):
+@pytest.mark.parametrize("shape, kernel, pairs_fn, call", list(tiled_only_params()))
+def test_mps_block_sparse_and_longformer_match_reference(shape, kernel, pairs_fn, call):
     q, k, v = (t.requires_grad_() for t in random_qkv(shape, device="mps"))
     grad_out = torch.randn(shape, generator=torch.Generator().manual_seed(1))
-    out = call(q, k, v)
+    out = call(q, k, v, kernel)
     grads = torch.autograd.grad(out, (q, k, v), grad_out.to("mps"))
 
     rq, rk, rv = (t.detach().cpu().double().requires_grad_() for t in (q, k, v))
@@ -378,7 +385,16 @@ LOW_PRECISION_CALLS = [
      lambda q, k, v: mps_attention.block_sparse_attention(q, k, v, 16)),
     ("longformer", lambda S: longformer_pairs(S, 4, 3),
      lambda q, k, v: mps_attention.longformer_attention(q, k, v, 4, 3)),
-]
+] + ([
+    ("window-mpp", lambda S: window_pairs(S, 5),
+     lambda q, k, v: mps_attention.sliding_window_attention(q, k, v, 5, kernel="mpp")),
+    ("financial-mpp", lambda S: financial_pairs(S, **FIN_SMALL),
+     lambda q, k, v: mps_attention.financial_attention(q, k, v, **FIN_SMALL, kernel="mpp")),
+    ("block-mpp", lambda S: block_sparse_pairs(S, 16),
+     lambda q, k, v: mps_attention.block_sparse_attention(q, k, v, 16, kernel="mpp")),
+    ("longformer-mpp", lambda S: longformer_pairs(S, 4, 3),
+     lambda q, k, v: mps_attention.longformer_attention(q, k, v, 4, 3, kernel="mpp")),
+] if MPP else [])
 
 
 @needs_mps_kernels
@@ -460,7 +476,7 @@ def test_mps_tiled_size_limit(monkeypatch):
     monkeypatch.setattr(mps_attention._PatternAttention, "apply",
                         lambda *args: calls.append(args[-1]) or original(*args))
     out = mps_attention.sliding_window_attention(q, k, v, 4)
-    assert calls == [False], "auto should pick the per-row kernel"
+    assert calls == ["row"], "auto should pick the per-row kernel"
     assert_close(out, reference_attention(q, k, v, window_pairs(70, 4)), atol=1e-4)
 
     with pytest.raises(ValueError):
@@ -490,3 +506,43 @@ def test_backends_block_sparse_and_longformer(device, head_dim):
                  reference_attention(q, k, v, block_sparse_pairs(50, 8)), atol=1e-4)
     assert_close(attention_backends.longformer_attention(q, k, v, 3, 2),
                  reference_attention(q, k, v, longformer_pairs(50, 3, 2)), atol=1e-4)
+
+
+@needs_mps_kernels
+def test_mps_kernel_selection(monkeypatch):
+    """kernel="auto" picks MPP only with Neural Accelerators (or MA_MPS_KERNEL=mpp); explicit choices are validated."""
+    monkeypatch.delenv("MA_MPS_KERNEL", raising=False)
+    q = torch.randn(1, 40, 2, 64, device="mps")
+    chosen = []
+    original = mps_attention._PatternAttention.apply
+    monkeypatch.setattr(mps_attention._PatternAttention, "apply",
+                        lambda *args: chosen.append(args[-1]) or original(*args))
+
+    monkeypatch.setattr(mps_attention, "has_neural_accelerators", lambda: False)
+    mps_attention.sliding_window_attention(q, q, q, 4)
+    monkeypatch.setattr(mps_attention, "has_neural_accelerators", lambda: True)
+    mps_attention.sliding_window_attention(q, q, q, 4)
+    monkeypatch.setenv("MA_MPS_KERNEL", "tiled")
+    mps_attention.sliding_window_attention(q, q, q, 4)
+    monkeypatch.setenv("MA_MPS_KERNEL", "row")
+    mps_attention.sliding_window_attention(q, q, q, 4)
+    mps_attention.block_sparse_attention(q, q, q, 8)   # no per-row block-sparse kernel
+    expected_mpp = "mpp" if MPP else "tiled"
+    assert chosen == ["tiled", expected_mpp, "tiled", "row", expected_mpp]
+
+    q16 = torch.randn(1, 40, 2, 16, device="mps")
+    with pytest.raises(ValueError):
+        mps_attention.sliding_window_attention(q16, q16, q16, 4, kernel="mpp")
+    with pytest.raises(ValueError):
+        mps_attention.block_sparse_attention(q, q, q, 8, kernel="row")
+
+
+@needs_mpp
+@pytest.mark.parametrize("seq_len", [1024, 2100])
+def test_mpp_financial_default_config(seq_len):
+    """MPP kernels on the default financial pattern, including the dilated clusters."""
+    shape = (1, seq_len, 2, 64)
+    q, k, v = random_qkv(shape, device="mps")
+    out = mps_attention.financial_attention(q, k, v, kernel="mpp")
+    defaults = dict(local_window_size=512, dilation_stride=1000, dilation_cluster_size=8, dilation_num_clusters=10)
+    assert_close(out, reference_attention(q, k, v, financial_pairs(seq_len, **defaults)), atol=1e-4)
