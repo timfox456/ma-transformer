@@ -13,7 +13,9 @@ printing the README table, --markdown checks the Metal kernels against the
 PyTorch implementation on this GPU and refuses to print if they disagree.
 
 The per-row kernel column is blank for block-sparse and Longformer, which only
-the tiled kernels implement.
+the block kernels implement. The MPP column (Metal Performance Primitives,
+which use the Neural Accelerators on M5 and later) appears when PyTorch's
+shader compiler supports Metal 4 (PyTorch 2.14 or later).
 """
 
 import argparse
@@ -46,11 +48,11 @@ TILED_ONLY = {"block", "longformer"}
 
 def run(pattern, impl, q):
     module = blocked_attention if impl == "pytorch" else mps_attention
-    if pattern == "block":
-        return module.block_sparse_attention(q, q, q, 64)
-    if pattern == "longformer":
-        return module.longformer_attention(q, q, q, 64, 2)
     kwargs = {} if impl == "pytorch" else {"kernel": impl}
+    if pattern == "block":
+        return module.block_sparse_attention(q, q, q, 64, **kwargs)
+    if pattern == "longformer":
+        return module.longformer_attention(q, q, q, 64, 2, **kwargs)
     if pattern == "financial":
         return module.financial_attention(q, q, q, **kwargs)
     window = 16 if pattern == "window16" else 64
@@ -97,6 +99,11 @@ def format_ms(ms):
 CHECK_TOLERANCE = {"float32": 1e-4, "float16": 5e-3, "bfloat16": 3e-2}
 
 
+def metal_kernels():
+    """Block kernels to benchmark: tiled always, MPP when it compiles here."""
+    return ("tiled", "mpp") if mps_attention.mpp_available() else ("tiled",)
+
+
 def verify_kernels(args):
     """
     Compare the Metal kernels with the PyTorch implementation (forward and
@@ -111,23 +118,25 @@ def verify_kernels(args):
         q, k, v = (torch.randn(shape, device="mps", dtype=dtype, requires_grad=True) for _ in range(3))
         grad_out = torch.randn(shape, device="mps", dtype=dtype)
         results = {}
-        for impl in ("tiled", "pytorch"):
-            inputs = [t if impl == "tiled" else t.detach().float().requires_grad_() for t in (q, k, v)]
-            module = mps_attention if impl == "tiled" else blocked_attention
+        for impl in ("pytorch",) + metal_kernels():
+            inputs = [t.detach().float().requires_grad_() if impl == "pytorch" else t for t in (q, k, v)]
+            module = blocked_attention if impl == "pytorch" else mps_attention
+            kwargs = {} if impl == "pytorch" else {"kernel": impl}
             if pattern == "block":
-                out = module.block_sparse_attention(*inputs, 64)
+                out = module.block_sparse_attention(*inputs, 64, **kwargs)
             elif pattern == "longformer":
-                out = module.longformer_attention(*inputs, 64, 2)
+                out = module.longformer_attention(*inputs, 64, 2, **kwargs)
             elif pattern == "financial":
-                out = module.financial_attention(*inputs)
+                out = module.financial_attention(*inputs, **kwargs)
             else:
-                out = module.sliding_window_attention(*inputs, 64)
+                out = module.sliding_window_attention(*inputs, 64, **kwargs)
             grads = torch.autograd.grad(out, inputs, grad_out.to(out.dtype))
             results[impl] = [t.detach().float() for t in (out, *grads)]
-        for name, got, want in zip(("output", "dQ", "dK", "dV"), results["tiled"], results["pytorch"]):
-            err = (got - want).abs().max().item() / max(want.abs().max().item(), 1.0)
-            if not err <= CHECK_TOLERANCE[args.dtype]:
-                failures.append(f"{pattern} {name}: relative error {err:.2e}")
+        for impl in metal_kernels():
+            for name, got, want in zip(("output", "dQ", "dK", "dV"), results[impl], results["pytorch"]):
+                err = (got - want).abs().max().item() / max(want.abs().max().item(), 1.0)
+                if not err <= CHECK_TOLERANCE[args.dtype]:
+                    failures.append(f"{pattern} {name} ({impl} kernel): relative error {err:.2e}")
     return failures
 
 
@@ -137,12 +146,15 @@ def markdown_table(args):
     if failures:
         sys.exit("Metal kernels disagree with the PyTorch implementation on this GPU; "
                  "not printing benchmark numbers:\n  " + "\n  ".join(failures))
+    impls = ("pytorch",) + metal_kernels()
+    titles = {"pytorch": "PyTorch (vectorized)", "tiled": "Metal (tiled)", "mpp": "Metal (MPP)"}
     lines = [f"Forward + backward on {machine_name()}, batch 1, 4 heads, head dim 64, {args.dtype}:", "",
-             "| Pattern | Sequence | PyTorch (vectorized) | Metal (tiled) |", "|---|---|---|---|"]
+             "| Pattern | Sequence | " + " | ".join(titles[i] for i in impls) + " |",
+             "|---|---|" + "---|" * len(impls)]
     for label, index in MARKDOWN_ROWS:
         _, shape, pattern = CASES[index]
         q = torch.randn(shape, device="mps", dtype=DTYPES[args.dtype], requires_grad=True)
-        cells = [time_ms(lambda: run(pattern, impl, q).sum().backward(), args.iterations) for impl in ("pytorch", "tiled")]
+        cells = [time_ms(lambda: run(pattern, impl, q).sum().backward(), args.iterations) for impl in impls]
         lines.append(f"| {label} | {shape[1]:,} | " + " | ".join(format_ms(ms) for ms in cells) + " |")
     print("\n".join(lines))
 
@@ -161,7 +173,7 @@ def main():
         markdown_table(args)
         return
 
-    impls = ["pytorch", "row", "tiled"]
+    impls = ["pytorch", "row"] + list(metal_kernels())
     header = f"{'case':12s} {'shape':20s}" + "".join(f" | {name + ' fwd / fwd+bwd (ms)':>28s}" for name in impls)
     print(header)
     print("-" * len(header))

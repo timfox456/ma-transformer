@@ -279,6 +279,7 @@ out = attn.longformer_attention(q, k, v, 64, 2)      # window plus 2 global toke
 ```
 
 - **Kernels:** head dims that are multiples of 8, up to 128, use tiled kernels built on `simdgroup_matrix`, for every pattern. Other head dims, up to 256, use a simpler per-row kernel for the window and financial patterns. Block-sparse and Longformer with those head dims fall back to PyTorch.
+- **Neural Accelerators (M5 and later):** a third kernel family runs the matrix products through Metal Performance Primitives (`mpp::tensor_ops::matmul2d`), which use the per-core Neural Accelerators on M5 and later. It needs PyTorch 2.14 or later, whose shader compiler targets Metal 4, and head dims that are multiples of 32, up to 128. `kernel="auto"` uses it only on chips with Neural Accelerators. On M1–M4 the same operations run on the shader cores and are 15–50% slower than the tiled kernels, which stay the default there. Set `MA_MPS_KERNEL=mpp`, `tiled` or `row` to override the choice, or `MA_DISABLE_MPP=1` to turn the MPP kernels off.
 - **Precision:** float32, float16 and bfloat16 inputs run natively. Arithmetic is float32, and outputs and gradients keep the input dtype. float16 matches float32 speed and halves activation memory. bfloat16 is slower on M1/M2, which lack bfloat16 hardware.
 - **First call:** each process compiles the kernels on first use, which takes about a second.
 - **Off switch:** set `MA_DISABLE_MPS_KERNELS=1` to fall back to the PyTorch implementation.
@@ -313,6 +314,7 @@ With Xcode installed and its license accepted, `scripts/profile_mps_kernels.py` 
 ```
 python scripts/profile_mps_kernels.py                          # financial, 16K tokens
 python scripts/profile_mps_kernels.py --pattern window --dtype float16 --out profile/
+python scripts/profile_mps_kernels.py --kernel mpp             # Neural Accelerator kernels
 ```
 
 ## Consulting & Production Integration

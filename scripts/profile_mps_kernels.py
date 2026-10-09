@@ -14,6 +14,7 @@ kernels run in separate phases, then prints for each kernel:
 
     python scripts/profile_mps_kernels.py
     python scripts/profile_mps_kernels.py --pattern window --seq 8192 --dtype float16
+    python scripts/profile_mps_kernels.py --kernel mpp      # Metal Performance Primitives kernels
 
 Requires Xcode (for xcrun xctrace) with its license accepted. The trace is
 kept in --out for opening in Instruments.
@@ -35,7 +36,6 @@ import xml.etree.ElementTree as ET
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 PHASES = ["forward", "dq", "dkdv"]
-KERNELS = {"forward": "tiled_forward", "dq": "tiled_backward_dq", "dkdv": "tiled_backward_dkdv"}
 COUNTERS = [
     "Compute Occupancy", "ALU Limiter", "ALU Utilization", "F32 Utilization", "F16 Utilization",
     "Buffer Read Limiter", "Buffer Write Limiter", "Threadgroup/Imageblock Load Limiter",
@@ -67,7 +67,9 @@ def kernel_calls(args):
     B, S, H, D = 1, args.seq, args.heads, args.head_dim
     S_pad = -(-S // M._TILE) * M._TILE
     q, k, v, g = (torch.randn(B, S_pad, H, D, device="mps").to(dtype) for _ in range(4))
-    lib = M._tiled_library(D, M._METAL_TYPES[dtype])
+    library, *names = M._BLOCK_KERNELS[args.kernel]
+    lib = library(D, M._METAL_TYPES[dtype])
+    forward, backward_dq, backward_dkdv = (getattr(lib, n) for n in names)
     kind, params, nseg = pattern_args(args.pattern)
     pat = M._param_tensor(tuple(params), q.device)
     launch = M._tiled_launch(B, H, S_pad)
@@ -75,13 +77,14 @@ def kernel_calls(args):
     out = torch.empty_like(q)
     lse = torch.empty(B, S_pad, H, device="mps")
     common = (pat, kind, nseg, B, S, S_pad, H, scale)
-    lib.tiled_forward(q, k, v, out, lse, *common, **launch)
+    forward(q, k, v, out, lse, *common, **launch)
     delta = (g.float() * out.float()).sum(-1).contiguous()
     dq, dk, dv = (torch.empty_like(q) for _ in range(3))
-    return lib, {
-        "forward": lambda: lib.tiled_forward(q, k, v, out, lse, *common, **launch),
-        "dq": lambda: lib.tiled_backward_dq(q, k, v, g, lse, delta, dq, *common, **launch),
-        "dkdv": lambda: lib.tiled_backward_dkdv(q, k, v, g, lse, delta, dk, dv, *common, **launch),
+    pipelines = {"forward": forward, "dq": backward_dq, "dkdv": backward_dkdv}
+    return pipelines, {
+        "forward": lambda: forward(q, k, v, out, lse, *common, **launch),
+        "dq": lambda: backward_dq(q, k, v, g, lse, delta, dq, *common, **launch),
+        "dkdv": lambda: backward_dkdv(q, k, v, g, lse, delta, dk, dv, *common, **launch),
     }
 
 
@@ -199,6 +202,8 @@ def main():
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--head-dim", type=int, default=64)
     parser.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32")
+    parser.add_argument("--kernel", choices=["tiled", "mpp"], default="tiled",
+                        help="block kernels to profile (mpp needs PyTorch 2.14+)")
     parser.add_argument("--reps", type=int, default=5)
     parser.add_argument("--out", help="directory for the trace and exported tables (default: a temp dir)")
     parser.add_argument("--json", action="store_true", help="print results as JSON")
@@ -218,22 +223,22 @@ def main():
     shutil.rmtree(trace, ignore_errors=True)
     workload = [sys.executable, os.path.abspath(__file__), "--workload", "--pattern", args.pattern,
                 "--seq", str(args.seq), "--heads", str(args.heads), "--head-dim", str(args.head_dim),
-                "--dtype", args.dtype, "--reps", str(args.reps)]
+                "--dtype", args.dtype, "--reps", str(args.reps), "--kernel", args.kernel]
     subprocess.run(["xcrun", "xctrace", "record", "--template", "Metal System Trace",
                     "--instrument", "Metal GPU Counters", "--output", trace, "--launch", "--", *workload],
                    check=True, stdout=subprocess.DEVNULL)
 
-    lib, _ = kernel_calls(args)
+    pipelines, _ = kernel_calls(args)
     result = analyze(trace, work, args.reps)
     for phase in PHASES:
-        kernel = getattr(lib, KERNELS[phase])
+        kernel = pipelines[phase]
         result[phase]["max_threads_per_threadgroup"] = kernel.max_threads_per_threadgroup
         result[phase]["threadgroup_memory_bytes"] = kernel.static_thread_group_memory_length
 
     if args.json:
         print(json.dumps(result, indent=2))
         return
-    print(f"{args.pattern}, seq {args.seq}, {args.heads} heads, head dim {args.head_dim}, {args.dtype}"
+    print(f"{args.pattern}, {args.kernel} kernels, seq {args.seq}, {args.heads} heads, head dim {args.head_dim}, {args.dtype}"
           f"  (trace: {trace})\n")
     rows = [("GPU time per call (ms)", lambda r: f"{r['gpu_ms_per_call']:.2f}"),
             ("Max threads/threadgroup", lambda r: str(r["max_threads_per_threadgroup"])),
